@@ -30,3 +30,4 @@ dist*
 data
 *.pcd
 *__pycache__
+*.ckpt
