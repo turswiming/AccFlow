@@ -20,6 +20,8 @@ from hydra.core.hydra_config import HydraConfig
 from src.dataset import HDF5Dataset
 from src.trainer import ModelWrapper
 from src.utils import InlineTee
+from src.dataset import HDF5Dataset, HDF5DatasetFutureFrames, collate_fn_pad, ToTensor
+from torchvision import transforms
 
 def precheck_cfg_valid(cfg):
     if os.path.exists(cfg.dataset_path + f"/{cfg.data_mode}") is False:
@@ -71,13 +73,24 @@ def main(cfg):
         logger = TensorBoardLogger(save_dir=output_dir, name="logs")
     
     trainer = pl.Trainer(logger=logger, devices=1)
+
+    # Choose dataset class based on model type
+    use_future_frames = checkpoint_params.cfg.model.name == 'accflow' or cfg.get('use_future_frames', False)
+    DatasetClass = HDF5DatasetFutureFrames if use_future_frames else HDF5Dataset
+
+    if use_future_frames:
+        print(f"---LOG[eval]: Using HDF5DatasetFutureFrames for AccFlow model evaluation")
+
     # NOTE(Qingwen): search & check: def eval_only_step_(self, batch, res_dict)
     trainer.validate(model = mymodel, \
                      dataloaders = DataLoader( \
-                                            HDF5Dataset(cfg.dataset_path + f"/{cfg.data_mode}", \
+                                            DatasetClass(cfg.dataset_path + f"/{cfg.data_mode}", \
                                                         n_frames=cfg.num_frames, \
-                                                        eval=True, leaderboard_version=cfg.leaderboard_version), \
-                                            batch_size=1, shuffle=False))
+                                                        eval=True, leaderboard_version=cfg.leaderboard_version, \
+                                                        transform=transforms.Compose([ToTensor()])), \
+                                            batch_size=16, shuffle=False,num_workers=32,\
+                                            collate_fn=collate_fn_pad,
+                                            ))
     if cfg.wandb_mode != "disabled":
         wandb.finish()
     print(f"---LOG[eval]: Finished feed-forward evaluation. Logging saved to {output_dir}/output.log")

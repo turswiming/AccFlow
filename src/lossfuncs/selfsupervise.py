@@ -188,3 +188,102 @@ def seflowLoss(res_dict, timer=None):
         'cluster_based_pc0pc1': moved_cluster_loss,
     }
     return res_loss
+
+
+def accflowLoss(res_dict, timer=None):
+    """
+    Self-supervised loss for AccumulateErrorFlow.
+
+    The accumulated flow from pc0 is compared against the target frame (pc_final)
+    using Chamfer distance. This allows self-supervised training without GT flow.
+
+    res_dict should contain:
+    - pc0: source point cloud [N, 3]
+    - pc_target: target point cloud (final frame) [M, 3]
+    - est_flow: accumulated flow from pc0 [N, 3]
+    - pc0_labels (optional): dynamic labels for pc0
+    - pc_target_labels (optional): dynamic labels for target frame
+    """
+    pc0 = res_dict['pc0']
+    pc_target = res_dict['pc_target']  # Final frame point cloud
+    est_flow = res_dict['est_flow']  # Accumulated flow
+
+    # Warped pc0 using accumulated flow
+    pseudo_pc_target = pc0 + est_flow
+
+    # Main loss: Chamfer distance between warped pc0 and real target
+    chamfer_dis = MyCUDAChamferDis(pseudo_pc_target, pc_target, truncate_dist=TRUNCATED_DIST)
+
+    # Optional: dynamic-specific losses if labels are provided
+    dynamic_chamfer_dis = torch.tensor(0.0, device=est_flow.device)
+    static_flow_loss = torch.tensor(0.0, device=est_flow.device)
+    cluster_loss = torch.tensor(0.0, device=est_flow.device)
+
+    if 'pc0_labels' in res_dict and 'pc_target_labels' in res_dict:
+        pc0_label = res_dict['pc0_labels']
+        pc_target_label = res_dict['pc_target_labels']
+
+        pc0_dynamic = pc0[pc0_label > 0]
+        pc_target_dynamic = pc_target[pc_target_label > 0]
+
+        have_dynamic_cluster = (pc0_dynamic.shape[0] > 256) & (pc_target_dynamic.shape[0] > 256)
+
+        if have_dynamic_cluster:
+            # Dynamic chamfer distance
+            dynamic_chamfer_dis = MyCUDAChamferDis(
+                pseudo_pc_target[pc0_label > 0],
+                pc_target_dynamic,
+                truncate_dist=TRUNCATED_DIST
+            )
+
+        # Static flow should be small (ego-motion compensated)
+        static_mask = pc0_label == 0
+        if static_mask.sum() > 0:
+            static_flow_loss = torch.linalg.vector_norm(est_flow[static_mask], dim=-1).mean()
+
+        # Cluster consistency loss: same cluster should have similar flow
+        # Similar to SeFlow's cluster_based_pc0pc1
+        unique_labels = torch.unique(pc0_label)
+        raw_dist0, raw_dist1, raw_idx0, _ = MyCUDAChamferDis.disid_res(pc0, pc_target)
+        moved_cluster_norms = torch.tensor([], device=est_flow.device)
+
+        for label in unique_labels:
+            if label > 1 and have_dynamic_cluster:  # label > 1 means dynamic with valid cluster id
+                mask = pc0_label == label
+                cluster_id_flow = est_flow[mask, :]
+                cluster_nnd = raw_dist0[mask]
+
+                if cluster_nnd.shape[0] <= 0:
+                    continue
+
+                # Find the point with max distance to target (likely edge point)
+                sorted_idxs = torch.argsort(cluster_nnd, descending=True)
+                nearby_label = pc_target_label[raw_idx0[mask][sorted_idxs]]
+                non_zero_valid_indices = torch.nonzero(nearby_label > 0)
+
+                if non_zero_valid_indices.shape[0] <= 0:
+                    continue
+
+                max_idx = sorted_idxs[non_zero_valid_indices.squeeze(1)[0]]
+
+                # Reference flow from nearest neighbor
+                max_flow = pc_target[raw_idx0[mask][max_idx]] - pc0[mask][max_idx]
+
+                # All points in cluster should have similar flow
+                moved_cluster_norms = torch.cat((
+                    moved_cluster_norms,
+                    torch.linalg.vector_norm((cluster_id_flow - max_flow), dim=-1)
+                ))
+
+        if moved_cluster_norms.shape[0] > 0:
+            cluster_loss = moved_cluster_norms.mean()
+        elif have_dynamic_cluster:
+            cluster_loss = torch.mean(raw_dist0[raw_dist0 <= TRUNCATED_DIST]) + torch.mean(raw_dist1[raw_dist1 <= TRUNCATED_DIST])
+
+    res_loss = {
+        'chamfer_dis': chamfer_dis,
+        'dynamic_chamfer_dis': dynamic_chamfer_dis,
+        'static_flow_loss': static_flow_loss,
+        'cluster_based_pc0pc1': cluster_loss,
+    }
+    return res_loss

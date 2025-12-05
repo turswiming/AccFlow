@@ -5,13 +5,12 @@ defaults:
   
 slurm_id: 00000
 
-wandb_mode: disabled # [offline, disabled, online]
+wandb_mode: offline # [offline, disabled, online]
 wandb_project_name: seflow
 
-train_data: /home/kin/data/av2/h5py/demo/train
+train_data: /workspace/preprocess_step1/preprocess_step1/sensor/train
 train_aug: False # involved by deltaflow
-val_data: /home/kin/data/av2/h5py/demo/val
-
+val_data: /workspace/preprocess_step1/preprocess_step1/sensor/val
 output: ${model.name}-${slurm_id}
 
 checkpoint: 
@@ -23,6 +22,8 @@ num_workers: 8
 gpus: 1 # will change in code: torch.cuda.device_count()
 sync_bn: true
 batch_size: 1
+val_batch_size: 8  # validation batch size, can be larger than train batch_size
+accumulate_grad_batches: 1
 epochs: 3
 gradient_clip_val: 5.0
 
@@ -30,14 +31,15 @@ gradient_clip_val: 5.0
 optimizer:
   name: Adam # [Adam, AdamW]
   lr: 2e-4
-loss_fn: deflowLoss # choices: [ff3dLoss, zeroflowLoss, deflowLoss, seflowLoss]
+loss_fn: deflowLoss # choices: [ff3dLoss, zeroflowLoss, deflowLoss, seflowLoss, accflowLoss]
 # add_seloss: {chamfer_dis: 1.0, static_flow_loss: 1.0, dynamic_chamfer_dis: 1.0, cluster_based_pc0pc1: 1.0}
-# ssl_label:
+ssl_label: seflow_auto  # choices: [seflow_auto, seflowpp_auto] - required for self-supervised loss
 
 # log settings
 seed: 42069
 log_every: 10 # steps epochs*dataset_size/batch_size
-val_every: 3 # epochs
+val_every: 1 # epochs - only used when val_check_interval=1.0
+val_check_interval: 0.1 # float (0-1): fraction of epoch to validate, e.g. 0.25=4x per epoch; 1.0=use val_every instead
 save_top_model: 5 # top_k model will be saved.
 
 # -----> Model and Task Parameters

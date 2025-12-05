@@ -1,6 +1,6 @@
 
-dataset_path: /home/kin/data/av2/h5py/sensor
-checkpoint: /home/kin/data/model_zoo/deltaflow_public/deltaflow-av2.ckpt
+dataset_path: /workspace/preprocess_step1/preprocess_step1/sensor
+checkpoint: /workspace/OpenSceneFlow/checkpoints/seflow_best.ckpt
 data_mode: val # [val, test]
 save_res: False # [True, False]
 

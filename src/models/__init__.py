@@ -21,11 +21,12 @@ except ImportError as e:
     print("\033[93m--- WARNING [model]: VoteFlow is not imported, as it requires some lib which is not installed.")
     print(f"Detail error message\033[0m: {e}. Just ignore this warning if code runs without these models.")
 
-# following need install extra package: 
+# following need install extra package:
 # * pip install spconv-cu117
 try:
     from .deltaflow import DeltaFlow
     from .flow4d import Flow4D
+    from .accflow import AccFlow
 except ImportError as e:
     print("\033[93m--- WARNING [model]: Model with SparseConv is not imported, as it requires spconv lib which is not installed.")
     print(f"Detail error message\033[0m: {e}. Just ignore this error if code runs without these models.")

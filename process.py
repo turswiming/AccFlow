@@ -45,7 +45,7 @@ def check_data_key(filekey, keyname, scene_id, ts):
         del filekey[keyname]
 
 def run_dufocluster(
-    data_dir: str ="/home/kin/data/av2/preprocess/sensor/train",
+    data_dir: str ="/workspace/preprocess_step1/preprocess_step1/sensor/train",
     scene_range: list = [0, 1],
     interval: int = 1, # interval frames to run dufomap only
     overwrite: bool = True,
@@ -104,7 +104,7 @@ def run_dufocluster(
 
 # since it's the only one need cuda to do. in case you want to run two single jobs.
 def run_nnd(
-    data_dir: str ="/home/kin/data/av2/preprocess/sensor/train",
+    data_dir: str ="/workspace/preprocess_step1/preprocess_step1/sensor/train",
     scene_range: list = [0, 1],
     interval: int = 1, # interval frames to run dufomap only
     overwrite: bool = True,
@@ -172,8 +172,8 @@ def run_nnd(
 
 # No Need GPU, CPU-only for following process.
 def main(
-    data_dir: str ="/home/kin/data/av2/preprocess/sensor/train",
-    scene_range: list = [0, 1],
+    data_dir: str ="/workspace/preprocess_step1/preprocess_step1/sensor/train",
+    scene_range: list = [600, 701],
     interval: int = 1, # interval frames to run dufomap only
     overwrite: bool = True,
 
@@ -306,8 +306,8 @@ def main(
         
 if __name__ == '__main__':
     start_time = time.time()
-    fire.Fire(main)
+    # fire.Fire(main)
     fire.Fire(run_dufocluster)
     print("\nAlready Finished the main labels: dufo, cluster, ground mask etc.\n")
-    # fire.Fire(run_nnd)
+    fire.Fire(run_nnd)
     print(f"\nScript Time used: {(time.time() - start_time)/60:.2f} mins")
