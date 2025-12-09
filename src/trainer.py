@@ -103,7 +103,7 @@ class ModelWrapper(LightningModule):
         self.model.timer[4].start("One Scan in model")
 
         # Check if this is AccFlow model with accumulated error training
-        is_accflow = self.model.__class__.__name__ == 'AccFlow'
+        is_accflow = self.model.__class__.__name__ in ['AccFlow', 'AccFlow2Frame']
         if is_accflow and self.cfg_loss_name == 'accflowLoss':
             res_dict = self.model(batch, training_mode=True)
         else:
@@ -144,17 +144,18 @@ class ModelWrapper(LightningModule):
                 pc0_valid = res_dict['pc0_points_lst'][batch_id]
 
                 # Get target frame point cloud for chamfer distance
+                # IMPORTANT: pc_target is in its own coordinate system, need to transform to pc0's coordinate
                 target_pc_key = f'pc{target_frame_idx}'
-                if target_pc_key in batch:
-                    pc_target = batch[target_pc_key][batch_id]
-                    # Remove NaN padding
-                    valid_mask_target = ~torch.isnan(pc_target[:, 0])
-                    pc_target = pc_target[valid_mask_target]
-                else:
-                    # Fallback to pc1 if target frame not available
-                    pc_target = batch['pc1'][batch_id]
-                    valid_mask_target = ~torch.isnan(pc_target[:, 0])
-                    pc_target = pc_target[valid_mask_target]
+                target_pose_key = f'pose{target_frame_idx}'
+                pc_target_raw = batch[target_pc_key][batch_id]
+                # Remove NaN padding
+                valid_mask_target = ~torch.isnan(pc_target_raw[:, 0])
+                pc_target_raw = pc_target_raw[valid_mask_target]
+
+                # Transform pc_target from its coordinate system to pc0's coordinate system
+                # This ensures pc0 and pc_target are in the same coordinate for chamfer distance
+                pose_target_to_1 = cal_pose0to1(batch[target_pose_key][batch_id], batch["pose1"][batch_id])
+                pc_target = pc_target_raw @ pose_target_to_1[:3, :3].T + pose_target_to_1[:3, 3]
 
                 dict2loss = {
                     'est_flow': accumulated_flow,
@@ -169,25 +170,27 @@ class ModelWrapper(LightningModule):
 
                     # Get target frame dynamic labels
                     target_dynamic_key = f'pc{target_frame_idx}_dynamic'
-                    if target_dynamic_key in batch:
-                        # Use target frame's dynamic labels
-                        dict2loss['pc_target_labels'] = batch[target_dynamic_key][batch_id][valid_mask_target]
-                    elif 'pc1_dynamic' in batch:
-                        # Fallback to pc1_dynamic if target frame labels not available
-                        pc1_valid_mask = ~torch.isnan(batch['pc1'][batch_id][:, 0])
-                        dict2loss['pc_target_labels'] = batch['pc1_dynamic'][batch_id][pc1_valid_mask]
+                    dict2loss['pc_target_labels'] = batch[target_dynamic_key][batch_id][valid_mask_target]
 
                 res_loss = self.loss_fn(dict2loss)
 
                 # Normalize loss by accumulation steps to keep gradient magnitude consistent
                 # This prevents larger gradients when using more accumulation steps
-                loss_scale = 1.0 / target_frame_idx  # target_frame_idx = number of accumulation steps
+                chamfer_loss_scale = 1.0 / target_frame_idx  # target_frame_idx = number of accumulation steps
 
                 for i, loss_name in enumerate(loss_items):
                     if loss_name in res_loss:
+                        if "chamfer" in loss_name:
+                            loss_scale = chamfer_loss_scale
+                        else:
+                            loss_scale = 1.0
                         total_loss += weights[i] * res_loss[loss_name] * loss_scale
                 for key in res_loss:
                     if key in loss_logger:
+                        if "chamfer" in key:
+                            loss_scale = chamfer_loss_scale
+                        else:
+                            loss_scale = 1.0
                         loss_logger[key] += res_loss[key] * loss_scale
         else:
             # Standard training flow for other models
@@ -235,11 +238,19 @@ class ModelWrapper(LightningModule):
         # means there are ground truth flow so we can evaluate the EPE-3 Way metric
         if batch['flow'][0].shape[0] > 0:
             pose_flows = res_dict['pose_flow']
+
             for batch_id, gt_flow in enumerate(batch["flow"]):
                 valid_from_pc2res = res_dict['pc0_valid_point_idxes'][batch_id]
                 pose_flow = pose_flows[batch_id][valid_from_pc2res]
 
-                final_flow_ = pose_flow.clone() + res_dict['flow'][batch_id]
+                network_flow = res_dict['flow'][batch_id]
+
+                # No rotation needed here:
+                # - AccFlow: forward() already rotates flow to pc1 coordinate
+                # - AccFlow2Frame: uses wrap_batch_pcs(), flow is already in pc1 coordinate
+                # - DeFlow/DeltaFlow: uses wrap_batch_pcs(), flow is already in pc1 coordinate
+
+                final_flow_ = pose_flow.clone() + network_flow
                 pc0 = batch['pc0'][batch_id][valid_from_pc2res]
                 gt_flow_valid = gt_flow[valid_from_pc2res]
                 flow_is_valid = batch['flow_is_valid'][batch_id][valid_from_pc2res]

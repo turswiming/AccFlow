@@ -18,4 +18,4 @@ eval_only: True
 wandb_mode: disabled # [offline, disabled, online]
 defaults:
   - hydra: default
-  - model: deflow
+  - model: accflow2frame

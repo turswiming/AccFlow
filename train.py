@@ -67,7 +67,7 @@ def main(cfg):
 
     # Choose dataset class based on model type
     # AccFlow uses future frames dataset, others use standard dataset
-    use_future_frames = cfg.model.name == 'accflow' or cfg.get('use_future_frames', False)
+    use_future_frames = cfg.model.name in ['accflow', 'accflow2frame'] or cfg.get('use_future_frames', False)
 
     if use_future_frames:
         print(f"[INFO] Using HDF5DatasetFutureFrames for future frame prediction")

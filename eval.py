@@ -88,7 +88,7 @@ def main(cfg):
                                                         n_frames=cfg.num_frames, \
                                                         eval=True, leaderboard_version=cfg.leaderboard_version, \
                                                         transform=transforms.Compose([ToTensor()])), \
-                                            batch_size=16, shuffle=False,num_workers=32,\
+                                            batch_size=8, shuffle=False,num_workers=32,\
                                             collate_fn=collate_fn_pad,
                                             ))
     if cfg.wandb_mode != "disabled":

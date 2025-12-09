@@ -8,7 +8,7 @@ target:
   planes: [16, 32, 64, 128, 256, 256, 128, 64, 32, 16] # 1st is #input channel, last is #output channel
   num_layer: [2, 2, 2, 2, 2, 2, 2, 2, 2] # MinkUnet 18
   decay_factor: 0.4
-  decoder_option: default # choices: [default, deflow]
+  decoder_option: time_aware # choices: [default, deflow, time_aware]
   knn_k: 3 # k for KNN interpolation in accumulated error training
   interpolation_method: knn # choices: [knn, three_nn, rbf, idw]
   # Probability distribution for number of accumulation steps during training

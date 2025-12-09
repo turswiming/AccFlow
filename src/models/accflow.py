@@ -16,7 +16,7 @@ import spconv.pytorch as spconv
 import spconv as spconv_core
 spconv_core.constants.SPCONV_ALLOW_TF32 = True
 
-from .basic import cal_pose0to1
+from .basic import cal_pose0to1,wrap_batch_pcs
 from .basic.encoder import DynamicVoxelizer, DynamicPillarFeatureNet
 from .basic.sparse_encoder import MinkUNet
 from .basic.decoder import SparseGRUHead
@@ -225,62 +225,50 @@ def wrap_batch_pcs_future(batch, num_frames=5):
 
     Frame layout: pc0, pc1, pc2, pc3, pc4 (t, t+1, t+2, t+3, t+4)
 
-    All point clouds are transformed to pc0's coordinate system for consistency.
+    All point clouds are transformed to pc1's coordinate system for consistency.
+    This matches the convention used by wrap_batch_pcs() in DeFlow/DeltaFlow.
     """
     batch_sizes = len(batch["pose0"])
 
     # Initialize result dictionary
     pcs_dict = {f'pc{i}s': [] for i in range(num_frames)}
-    pcs_dict['pose_flows'] = {i: [] for i in range(num_frames - 1)}  # pose_flow for each transition
+    pcs_dict['pose_flows'] = []  # pose_flow for pc0 -> pc1 transition (matches wrap_batch_pcs output format)
 
     for batch_id in range(batch_sizes):
-        # Reference pose is pc0's pose - all other frames transform to pc0's coordinate
-        ref_pose = batch["pose0"][batch_id]
+        # Reference pose is pc1's pose - all frames transform to pc1's coordinate
+        ref_pose = batch["pose1"][batch_id]
 
         with torch.no_grad():
-            # pc0 stays in its own coordinate (no transformation needed for the base)
-            pcs_dict['pc0s'].append(batch["pc0"][batch_id])
+            # Transform pc0 to pc1's coordinate system
+            pose_0to1 = cal_pose0to1(batch["pose0"][batch_id], ref_pose)
+            pc0 = batch["pc0"][batch_id]
+            pc0_transformed = pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
+            pcs_dict['pc0s'].append(pc0_transformed)
+            
+            # Compute pose_flow for pc0 (matches wrap_batch_pcs output format)
+            pose_flow = pc0_transformed - pc0
+            pcs_dict['pose_flows'].append(pose_flow)
 
-            # Process each future frame
-            for i in range(1, num_frames):
+            # pc1 stays in its own coordinate (it IS the reference)
+            pcs_dict['pc1s'].append(batch["pc1"][batch_id])
+
+            # Process future frames (pc2, pc3, pc4, ...) - transform to pc1's coordinate
+            for i in range(2, num_frames):
                 pc_key = f'pc{i}'
                 pose_key = f'pose{i}'
 
                 if pc_key in batch and pose_key in batch:
-                    # Transform pc_i to pc0's coordinate system
-                    pose_i_to_0 = cal_pose0to1(batch[pose_key][batch_id], ref_pose)
+                    # Transform pc_i to pc1's coordinate system
+                    pose_i_to_1 = cal_pose0to1(batch[pose_key][batch_id], ref_pose)
                     pc_i = batch[pc_key][batch_id]
-                    pc_i_transformed = pc_i @ pose_i_to_0[:3, :3].T + pose_i_to_0[:3, 3]
+                    pc_i_transformed = pc_i @ pose_i_to_1[:3, :3].T + pose_i_to_1[:3, 3]
                     pcs_dict[f'pc{i}s'].append(pc_i_transformed)
-
-            # Compute pose flows for each consecutive pair (in pc0's coordinate system)
-            # pose_flow_i represents ego motion from frame i to frame i+1, applied to points in pc0's coords
-            for i in range(num_frames - 1):
-                pose_key_i = f'pose{i}'
-                pose_key_i1 = f'pose{i+1}'
-
-                if pose_key_i in batch and pose_key_i1 in batch:
-                    # Pose from frame i to frame i+1
-                    pose_i_to_i1 = cal_pose0to1(batch[pose_key_i][batch_id], batch[pose_key_i1][batch_id])
-
-                    # For pc0, compute the pose flow (displacement due to ego motion)
-                    pc_i_key = f'pc{i}'
-                    if pc_i_key in batch:
-                        pc_i = batch[pc_i_key][batch_id]
-                        pc_i_transformed = pc_i @ pose_i_to_i1[:3, :3].T + pose_i_to_i1[:3, 3]
-                        pose_flow = pc_i_transformed - pc_i
-                        pcs_dict['pose_flows'][i].append(pose_flow)
 
     # Stack all lists into tensors
     for i in range(num_frames):
         key = f'pc{i}s'
         if pcs_dict[key]:
             pcs_dict[key] = torch.stack(pcs_dict[key], dim=0)
-
-    # Stack pose flows
-    for i in range(num_frames - 1):
-        if pcs_dict['pose_flows'][i]:
-            pcs_dict['pose_flows'][i] = pcs_dict['pose_flows'][i]  # Keep as list for per-point handling
 
     return pcs_dict
 
@@ -317,6 +305,103 @@ class AccFlowEncoder(nn.Module):
             self.timer.start("Total")
         else:
             self.timer = timer
+
+    def voxelize_all_frames(self, pcs_dict, num_frames):
+        """
+        Pre-voxelize all frames and cache the results.
+
+        Args:
+            pcs_dict: Dictionary containing point clouds pc0s, pc1s, pc2s, ...
+            num_frames: Number of frames to voxelize
+
+        Returns:
+            cache: Dictionary with voxelization results for each frame
+        """
+        cache = {}
+        for i in range(num_frames):
+            pc_key = f'pc{i}s'
+            if pc_key not in pcs_dict:
+                continue
+            pc = pcs_dict[pc_key]
+            voxel_info_list = self.voxelizer(pc)
+            voxel_feats_sp, coors_batch_sp, point_feats_lst = self.process_batch(
+                voxel_info_list, if_return_point_feats=True
+            )
+            cache[i] = {
+                'voxel_info_list': voxel_info_list,
+                'voxel_feats_sp': voxel_feats_sp,
+                'coors_batch_sp': coors_batch_sp,
+                'point_feats_lst': point_feats_lst,
+            }
+        return cache
+
+    def forward_with_cache(self, pcs_dict, voxel_cache, time_idx: int = 0) -> torch.Tensor:
+        """
+        Forward pass using pre-cached voxelization results.
+
+        Args:
+            pcs_dict: Dictionary containing point clouds (for batch size info)
+            voxel_cache: Pre-computed voxelization cache from voxelize_all_frames
+            time_idx: Which frame pair to predict (0 means pc0->pc1, etc.)
+
+        Returns:
+            Dictionary with sparse features and voxel info
+        """
+        bz_ = pcs_dict['pc0s'].shape[0]
+        device = pcs_dict['pc0s'].device
+
+        # Create one-hot time embedding
+        time_embed = torch.zeros(bz_, self.time_embed_dim, device=device)
+        time_embed[:, time_idx] = 1.0
+        time_feat = self.time_proj(time_embed)  # [B, feat_channels]
+
+        # Get cached voxelization for source and target frames
+        src_cache = voxel_cache[time_idx]
+        tgt_cache = voxel_cache[time_idx + 1]
+
+        src_voxel_feats_sp = src_cache['voxel_feats_sp']
+        src_coors_batch_sp = src_cache['coors_batch_sp']
+        src_voxel_info_list = src_cache['voxel_info_list']
+        src_point_feats_lst = src_cache['point_feats_lst']
+
+        tgt_voxel_feats_sp = tgt_cache['voxel_feats_sp']
+        tgt_coors_batch_sp = tgt_cache['coors_batch_sp']
+        tgt_voxel_info_list = tgt_cache['voxel_info_list']
+
+        sparse_max_size = [bz_, *self.voxel_spatial_shape, self.num_feature]
+        sparse_tgt = torch.sparse_coo_tensor(tgt_coors_batch_sp.t(), tgt_voxel_feats_sp, size=sparse_max_size)
+        sparse_src = torch.sparse_coo_tensor(src_coors_batch_sp.t(), src_voxel_feats_sp, size=sparse_max_size)
+
+        # Compute delta (difference) features
+        sparse_diff = sparse_tgt - sparse_src
+
+        # Add time embedding to the features
+        self.timer[2].start("D_Delta_Sparse")
+        features = sparse_diff.coalesce().values()
+        indices = sparse_diff.coalesce().indices().t().to(dtype=torch.int32)
+
+        # Add time embedding: for each voxel, add the corresponding batch's time feature
+        batch_indices_for_time = indices[:, 0].long()
+        time_feat_expanded = time_feat[batch_indices_for_time]  # [num_voxels, feat_channels]
+        features = features + time_feat_expanded
+
+        all_pcdiff_sparse = spconv.SparseConvTensor(
+            features.contiguous(), indices.contiguous(),
+            self.voxel_spatial_shape, bz_
+        )
+        self.timer[2].stop()
+
+        output = {
+            'delta_sparse': all_pcdiff_sparse,
+            'src_3dvoxel_infos_lst': src_voxel_info_list,
+            'src_point_feats_lst': src_point_feats_lst,
+            'src_num_voxels': src_voxel_feats_sp.shape[0],
+            'tgt_3dvoxel_infos_lst': tgt_voxel_info_list,
+            'tgt_num_voxels': tgt_voxel_feats_sp.shape[0],
+            'd_num_voxels': indices.shape[0],
+            'time_idx': time_idx,
+        }
+        return output
 
     def process_batch(self, voxel_info_list, if_return_point_feats=False):
         voxel_feats_list_batch = []
@@ -417,6 +502,107 @@ class AccFlowEncoder(nn.Module):
         return output
 
 
+class TimeAwarePointHead(nn.Module):
+    """
+    Point head with time embedding for AccFlow.
+
+    Adds time embedding to the decoder to reinforce time-awareness throughout the network.
+    The time embedding is concatenated with point features before the final MLP.
+
+    Architecture:
+        Input: voxel_feat (from backbone) + point_feat (from encoder) + time_embed
+        → MLP → flow [N, 3]
+    """
+
+    def __init__(self, voxel_feat_dim: int = 16, point_feat_dim: int = 16,
+                 time_embed_dim: int = 4, time_hidden_dim: int = 8):
+        """
+        Args:
+            voxel_feat_dim: Dimension of voxel features from backbone
+            point_feat_dim: Dimension of point features from encoder
+            time_embed_dim: Dimension of one-hot time embedding (num_frames - 1)
+            time_hidden_dim: Hidden dimension for time embedding projection
+        """
+        super().__init__()
+
+        self.time_embed_dim = time_embed_dim
+
+        # Project time embedding to a smaller hidden dimension
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_embed_dim, time_hidden_dim),
+            nn.ReLU(),
+        )
+
+        # Total input dim = voxel_feat + point_feat + time_hidden
+        self.input_dim = voxel_feat_dim + point_feat_dim + time_hidden_dim
+
+        self.PPmodel_flow = nn.Sequential(
+            nn.Linear(self.input_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, 3)
+        )
+
+    def forward_single(self, voxel_feat, voxel_coords, point_feat, time_feat_expanded):
+        """
+        Forward for a single batch item.
+
+        Args:
+            voxel_feat: [C, D, H, W] dense voxel features
+            voxel_coords: [N, 3] voxel coordinates for each point
+            point_feat: [N, point_feat_dim] point features
+            time_feat_expanded: [N, time_hidden_dim] time embedding expanded to each point
+
+        Returns:
+            flow: [N, 3] predicted flow
+        """
+        # Get voxel features at point locations
+        voxel_to_point_feat = voxel_feat[:, voxel_coords[:, 2], voxel_coords[:, 1], voxel_coords[:, 0]].T
+
+        # Concatenate all features: voxel + point + time
+        concated_point_feat = torch.cat([voxel_to_point_feat, point_feat, time_feat_expanded], dim=-1)
+
+        flow = self.PPmodel_flow(concated_point_feat)
+        return flow
+
+    def forward(self, sparse_tensor, voxelizer_infos, pc0_point_feats_lst, time_idx: int = 0):
+        """
+        Forward pass with time embedding.
+
+        Args:
+            sparse_tensor: Sparse tensor from backbone
+            voxelizer_infos: List of voxelizer info dicts
+            pc0_point_feats_lst: List of point features
+            time_idx: Which frame pair (0, 1, 2, or 3)
+
+        Returns:
+            List of flow tensors, one per batch item
+        """
+        voxel_feats = sparse_tensor.dense()
+        batch_size = len(voxelizer_infos)
+        device = voxel_feats.device
+
+        # Create one-hot time embedding and project
+        time_embed = torch.zeros(batch_size, self.time_embed_dim, device=device)
+        time_embed[:, time_idx] = 1.0
+        time_feat = self.time_proj(time_embed)  # [B, time_hidden_dim]
+
+        flow_outputs = []
+        for batch_idx, voxelizer_info in enumerate(voxelizer_infos):
+            voxel_coords = voxelizer_info["voxel_coords"]
+            point_feat = pc0_point_feats_lst[batch_idx]
+            voxel_feat = voxel_feats[batch_idx, :]
+
+            # Expand time features to each point
+            num_points = point_feat.shape[0]
+            time_feat_expanded = time_feat[batch_idx:batch_idx+1].expand(num_points, -1)
+
+            flow = self.forward_single(voxel_feat, voxel_coords, point_feat, time_feat_expanded)
+            flow_outputs.append(flow)
+
+        return flow_outputs
+
+
 class AccFlow(nn.Module):
     """
     AccumulateErrorFlow model.
@@ -477,8 +663,18 @@ class AccFlow(nn.Module):
         )
         self.backbone = MinkUNet(planes, num_layer)
 
+        # Decoder selection
+        self.decoder_option = decoder_option
         if decoder_option == "deflow":
             self.flowdecoder = SparseGRUHead(voxel_feat_dim=voxel_output_ch, point_feat_dim=point_output_ch, num_iters=1)
+        elif decoder_option == "time_aware":
+            # TimeAwarePointHead with time embedding in decoder
+            self.flowdecoder = TimeAwarePointHead(
+                voxel_feat_dim=voxel_output_ch,
+                point_feat_dim=point_output_ch,
+                time_embed_dim=num_frames - 1,  # 4 for 5 frames
+                time_hidden_dim=8
+            )
         else:
             self.flowdecoder = Point_head(voxel_feat_dim=voxel_output_ch, point_feat_dim=point_output_ch)
 
@@ -515,7 +711,50 @@ class AccFlow(nn.Module):
         self.timer[3].stop()
 
         self.timer[4].start("Flow Decoder")
-        flows = self.flowdecoder(backbone_res, src_3dvoxel_infos_lst, sparse_dict['src_point_feats_lst'])
+        # Pass time_idx to decoder if it's TimeAwarePointHead
+        if self.decoder_option == "time_aware":
+            flows = self.flowdecoder(backbone_res, src_3dvoxel_infos_lst, sparse_dict['src_point_feats_lst'], time_idx=time_idx)
+        else:
+            flows = self.flowdecoder(backbone_res, src_3dvoxel_infos_lst, sparse_dict['src_point_feats_lst'])
+        self.timer[4].stop()
+
+        return {
+            "flow": flows,
+            "src_valid_point_idxes": [e["point_idxes"] for e in src_3dvoxel_infos_lst],
+            "src_points_lst": [e["points"] for e in src_3dvoxel_infos_lst],
+            "tgt_valid_point_idxes": [e["point_idxes"] for e in sparse_dict['tgt_3dvoxel_infos_lst']],
+            "tgt_points_lst": [e["points"] for e in sparse_dict['tgt_3dvoxel_infos_lst']],
+            "d_num_voxels": sparse_dict['d_num_voxels'],
+            "time_idx": time_idx,
+        }
+
+    def forward_single_with_cache(self, pcs_dict, voxel_cache, time_idx: int = 0):
+        """
+        Forward pass for a single time index using cached voxelization.
+
+        Args:
+            pcs_dict: Dictionary with transformed point clouds
+            voxel_cache: Pre-computed voxelization cache
+            time_idx: Which frame pair to predict (0=pc0->pc1, 1=pc1->pc2, etc.)
+
+        Returns:
+            Dictionary with flow predictions and auxiliary info
+        """
+        self.timer[1].start("3D Sparse Voxel (cached)")
+        sparse_dict = self.pc2voxel.forward_with_cache(pcs_dict, voxel_cache, time_idx=time_idx)
+        self.timer[1].stop()
+
+        self.timer[3].start("3D Network")
+        backbone_res = self.backbone(sparse_dict['delta_sparse'])
+        src_3dvoxel_infos_lst = sparse_dict['src_3dvoxel_infos_lst']
+        self.timer[3].stop()
+
+        self.timer[4].start("Flow Decoder")
+        # Pass time_idx to decoder if it's TimeAwarePointHead
+        if self.decoder_option == "time_aware":
+            flows = self.flowdecoder(backbone_res, src_3dvoxel_infos_lst, sparse_dict['src_point_feats_lst'], time_idx=time_idx)
+        else:
+            flows = self.flowdecoder(backbone_res, src_3dvoxel_infos_lst, sparse_dict['src_point_feats_lst'])
         self.timer[4].stop()
 
         return {
@@ -549,18 +788,51 @@ class AccFlow(nn.Module):
             # Training with accumulated error
             return self.forward_accumulated_error(batch, pcs_dict)
         else:
-            # Normal inference: predict pc0 -> pc1 flow
+            # Normal inference: predict flow for frame pair specified by time_idx
             result = self.forward_single(pcs_dict, time_idx=time_idx)
 
-            # Add pose flow for the specified time index
-            result['pose_flow'] = pcs_dict['pose_flows'][time_idx]
+            # Determine source and target frame based on time_idx
+            src_frame = time_idx
+            tgt_frame = time_idx + 1
+            src_pose_key = f"pose{src_frame}"
+            tgt_pose_key = f"pose{tgt_frame}"
+            src_pc_key = f"pc{src_frame}"
+
+            # Transform flow from source coordinate to target coordinate for evaluation
+            # The network predicts flow in source frame's coordinate system, but evaluation
+            # expects flow in target frame's coordinate system (like SeFlow/DeltaFlow)
+            # Flow is a vector, so only rotation is needed (no translation)
+            batch_size = len(batch["pose0"])
+            transformed_flows = []
+            for b in range(batch_size):
+                flow_src = result['flow'][b]  # [N, 3] in source coordinate
+                # Get rotation from source to target
+                pose_src_to_tgt = cal_pose0to1(batch[src_pose_key][b], batch[tgt_pose_key][b])
+                R_src_to_tgt = pose_src_to_tgt[:3, :3]  # [3, 3]
+                # Rotate flow vector to target coordinate
+                flow_tgt = flow_src @ R_src_to_tgt.T
+                transformed_flows.append(flow_tgt)
+            result['flow'] = transformed_flows
+
+            # Recompute pose_flow in target coordinate system (matching SeFlow/DeltaFlow convention)
+            # pose_flow = transform_src - src, where transform_src is source transformed to target coord
+            pose_flows = []
+            for b in range(batch_size):
+                pc_src = batch[src_pc_key][b]
+                pose_src_to_tgt = cal_pose0to1(batch[src_pose_key][b], batch[tgt_pose_key][b])
+                transform_pc_src = pc_src @ pose_src_to_tgt[:3, :3].T + pose_src_to_tgt[:3, 3]
+                pose_flow = transform_pc_src - pc_src
+                pose_flows.append(pose_flow)
+            result['pose_flow'] = pose_flows
 
             # For compatibility, also add pc0/pc1 specific keys
+            # Note: these indices are relative to the source frame (pc{time_idx})
             result["pc0_valid_point_idxes"] = result["src_valid_point_idxes"]
             result["pc0_points_lst"] = result["src_points_lst"]
             result["pc1_valid_point_idxes"] = result["tgt_valid_point_idxes"]
             result["pc1_points_lst"] = result["tgt_points_lst"]
             result["d_num_voxels"] = [result["d_num_voxels"]]
+            result["time_idx"] = time_idx
 
             return result
 
@@ -591,12 +863,13 @@ class AccFlow(nn.Module):
         """
         Training forward pass with accumulated error propagation.
 
+        OPTIMIZED VERSION: Uses batched forward and caches voxelization results.
+
         This implements the self-supervised training procedure:
-        1. Predict flow F0 from pc0 -> pc1
-        2. Create warped point cloud P1' = P0 + F0
-        3. Use KNN to interpolate F1 from P1 to P1'
-        4. Continue accumulating: P2' = P1' + F1', P3' = P2' + F2', etc.
-        5. Final accumulated flow is used for self-supervised loss
+        1. Pre-voxelize all frames once (cached)
+        2. Batch forward for each time_idx (all samples in batch together)
+        3. KNN interpolation per sample (cannot be batched due to varying point counts)
+        4. Accumulate flow predictions
 
         With accumulate_probs configured, the number of accumulation steps is sampled:
         - 1 step: only F0 (pc0->pc1)
@@ -615,113 +888,85 @@ class AccFlow(nn.Module):
         max_steps = self.num_frames - 1
         num_acc_steps = min(num_acc_steps, max_steps)
 
-        # Results for each batch
-        all_accumulated_flows = []
+        # ====== OPTIMIZATION 1: Pre-voxelize all frames once ======
+        self.timer[1].start("Voxelize All Frames")
+        voxel_cache = self.pc2voxel.voxelize_all_frames(pcs_dict, num_frames=num_acc_steps + 1)
+        self.timer[1].stop()
+
+        # ====== OPTIMIZATION 2: Batched forward for time_idx=0 ======
+        # All samples in batch are processed together
+        result_0 = self.forward_single_with_cache(pcs_dict, voxel_cache, time_idx=0)
+
+        # Extract per-sample results
+        flows_t0 = result_0['flow']  # List of [N_i, 3] for each sample
+        valid_idxes_t0 = result_0['src_valid_point_idxes']  # List of valid indices
+
+        # Initialize accumulated positions and flows for each sample
+        accumulated_positions = []  # List of [N_i, 3]
+        accumulated_flows = []  # List of [N_i, 3]
         all_valid_idxes = []
         all_pc0_points = []
 
         for batch_id in range(batch_size):
-            # Get individual point clouds for this batch
-            pc0 = pcs_dict['pc0s'][batch_id]  # [N0, 3]
-
-            # Remove NaN padding
+            pc0 = pcs_dict['pc0s'][batch_id]
             valid_mask = ~torch.isnan(pc0[:, 0])
             pc0 = pc0[valid_mask]
 
-            # Predict F0: pc0 -> pc1
-            single_pcs_dict = {
-                f'pc{i}s': pcs_dict[f'pc{i}s'][batch_id:batch_id+1]
-                for i in range(self.num_frames)
-                if f'pc{i}s' in pcs_dict
-            }
+            flow_0 = flows_t0[batch_id]
+            valid_idx_0 = valid_idxes_t0[batch_id]
 
-            result_0 = self.forward_single(single_pcs_dict, time_idx=0)
-            flow_0 = result_0['flow'][0]  # [N0_valid, 3]
-            valid_idx_0 = result_0['src_valid_point_idxes'][0]
+            pc0_valid = pc0[valid_idx_0]
+            accumulated_pos = pc0_valid + flow_0
+            accumulated_flow = flow_0.clone()
 
-            # Initialize accumulated position and valid indices
-            # P1' = P0 + F0 (warped position)
-            pc0_valid = pc0[valid_idx_0]  # Points that went through the network
-            accumulated_pos = pc0_valid + flow_0  # P1'
-            accumulated_flow = flow_0.clone()  # Total displacement from pc0
+            accumulated_positions.append(accumulated_pos)
+            accumulated_flows.append(accumulated_flow)
+            all_valid_idxes.append(valid_idx_0)
+            all_pc0_points.append(pc0_valid)
 
-            # Iterate through remaining frame pairs (up to num_acc_steps)
-            # num_acc_steps=1 means only F0, so loop doesn't run
-            # num_acc_steps=2 means F0+F1, so t=1 only
-            for t in range(1, num_acc_steps):
-                # Get real pc at time t+1
-                pc_t1 = pcs_dict[f'pc{t+1}s'][batch_id]
-                valid_mask_t1 = ~torch.isnan(pc_t1[:, 0])
-                pc_t1 = pc_t1[valid_mask_t1]
+        # ====== Iterate through remaining time steps ======
+        for t in range(1, num_acc_steps):
+            # ====== OPTIMIZATION 2: Batched forward for time_idx=t ======
+            result_t = self.forward_single_with_cache(pcs_dict, voxel_cache, time_idx=t)
+            flows_t = result_t['flow']
+            valid_idxes_t = result_t['src_valid_point_idxes']
 
-                # Get real pc at time t
+            # KNN interpolation must be done per-sample (varying point counts)
+            for batch_id in range(batch_size):
+                accumulated_pos = accumulated_positions[batch_id]
+                accumulated_flow = accumulated_flows[batch_id]
+
+                # Get pc_t valid points
                 pc_t = pcs_dict[f'pc{t}s'][batch_id]
                 valid_mask_t = ~torch.isnan(pc_t[:, 0])
                 pc_t = pc_t[valid_mask_t]
 
-                # Predict F_t: pc_t -> pc_{t+1}
-                result_t = self.forward_single(single_pcs_dict, time_idx=t)
-                flow_t = result_t['flow'][0]  # [N_t_valid, 3]
-                valid_idx_t = result_t['src_valid_point_idxes'][0]
-
-                # Get valid points from pc_t
+                flow_t = flows_t[batch_id]
+                valid_idx_t = valid_idxes_t[batch_id]
                 pc_t_valid = pc_t[valid_idx_t]
 
-                # Use interpolation to get F_t from pc_t to accumulated_pos (P_t')
-                # accumulated_pos is where our points ended up after previous accumulation
-                # We need to find corresponding flow values at these positions
                 if accumulated_pos.shape[0] > 0 and pc_t_valid.shape[0] > 0:
-                    # Use configured interpolation method
-                    if self.interpolation_method == 'knn':
-                        interpolated_flow = interpolate_flow(
-                            accumulated_pos, pc_t_valid, flow_t,
-                            method='knn', k=self.knn_k
-                        )
-                    elif self.interpolation_method == 'three_nn':
-                        interpolated_flow = interpolate_flow(
-                            accumulated_pos, pc_t_valid, flow_t,
-                            method='three_nn'
-                        )
-                    elif self.interpolation_method == 'rbf':
-                        interpolated_flow = interpolate_flow(
-                            accumulated_pos, pc_t_valid, flow_t,
-                            method='rbf', sigma=0.5, max_neighbors=self.knn_k * 4
-                        )
-                    elif self.interpolation_method == 'idw':
-                        interpolated_flow = interpolate_flow(
-                            accumulated_pos, pc_t_valid, flow_t,
-                            method='idw', power=2, k=self.knn_k
-                        )
-                    else:
-                        # Default to KNN
-                        interpolated_flow = interpolate_flow(
-                            accumulated_pos, pc_t_valid, flow_t,
-                            method='knn', k=self.knn_k
-                        )
+                    # Interpolate flow from pc_t to accumulated_pos
+                    interpolated_flow = interpolate_flow(
+                        accumulated_pos, pc_t_valid, flow_t,
+                        method=self.interpolation_method,
+                        k=self.knn_k
+                    )
 
                     # Update accumulated position and flow
-                    accumulated_pos = accumulated_pos + interpolated_flow  # P_{t+1}'
-                    accumulated_flow = accumulated_flow + interpolated_flow
-
-            # Store results for this batch
-            all_accumulated_flows.append(accumulated_flow)
-            all_valid_idxes.append(valid_idx_0)
-            all_pc0_points.append(pc0_valid)
+                    accumulated_positions[batch_id] = accumulated_pos + interpolated_flow
+                    accumulated_flows[batch_id] = accumulated_flow + interpolated_flow
 
         # Package results
-        # The accumulated flow represents the total displacement from pc0 to the final warped position
-        # This can be compared against the real pc_final using chamfer distance
-
-        # Get pose flow for pc0 -> pc1 (used for reference)
         pose_flows = pcs_dict['pose_flows'][0]
 
         result = {
-            "flow": all_accumulated_flows,  # Accumulated flow from pc0
+            "flow": accumulated_flows,
             "pose_flow": pose_flows,
             "pc0_valid_point_idxes": all_valid_idxes,
             "pc0_points_lst": all_pc0_points,
-            "accumulated_target_frame": num_acc_steps,  # Index of the target frame (1=pc1, 2=pc2, etc.)
-            "d_num_voxels": [0],  # Placeholder
+            "accumulated_target_frame": num_acc_steps,
+            "d_num_voxels": [0],
         }
 
         return result
@@ -895,3 +1140,431 @@ class AccFlow(nn.Module):
         # TODO: 实现完整的坐标变换
         # 当前简化：假设所有帧已经在同一坐标系下（通过 wrap_batch_pcs_future）
         return flow
+
+
+class AccFlow2Frame(nn.Module):
+    """
+    2-Frame AccFlow with Sliding Window Accumulated Error Training.
+
+    Key features:
+    1. Network only sees 2 frames at a time (pc_t, pc_{t+1})
+    2. No time embedding - simpler architecture like DeFlow
+    3. Training uses sliding window on 5-frame sequences:
+       - Predict F0: pc0 -> pc1
+       - Warp pc0 to pc1', use KNN to get F1 from pc1
+       - Predict F1: pc1 -> pc2 (with real pc1, pc2)
+       - Accumulate: pc0 + F0 + interpolated_F1 + ...
+    4. Loss computed on accumulated trajectory vs final frame
+
+    This allows the model to learn consistent flow prediction that
+    accumulates well over multiple frames, without needing time embedding.
+    """
+
+    def __init__(self, voxel_size=[0.2, 0.2, 0.2],
+                 point_cloud_range=[-51.2, -51.2, -2.2, 51.2, 51.2, 4.2],
+                 grid_feature_size=[512, 512, 32],
+                 num_frames=5,  # Number of frames in dataset for accumulation
+                 planes=[16, 32, 64, 128, 256, 256, 128, 64, 32, 16],
+                 num_layer=[2, 2, 2, 2, 2, 2, 2, 2, 2],
+                 decay_factor=1.0,
+                 decoder_option="default",
+                 knn_k=3,
+                 interpolation_method="knn",
+                 accumulate_probs=None,
+                 ):
+        super().__init__()
+        point_output_ch = planes[0]
+        voxel_output_ch = planes[-1]
+        self.timer = dztimer.Timing()
+        self.num_frames = num_frames  # For accumulation training
+        self.knn_k = knn_k
+        self.interpolation_method = interpolation_method
+        self.accumulate_probs = accumulate_probs
+
+        if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or not torch.distributed.is_initialized():
+            print('[LOG] AccFlow2Frame Param detail: voxel_size = {}, pseudo_dims = {}, num_frames={}'.format(
+                voxel_size, grid_feature_size, num_frames))
+            print('[LOG] Model detail: planes = {}, time decay = {}, decoder = {}, knn_k = {}, interp = {}'.format(
+                planes, decay_factor, decoder_option, knn_k, interpolation_method))
+            print('[LOG] Accumulate probs: {}'.format(self.accumulate_probs))
+
+        # Simple 2-frame encoder without time embedding
+        self.pc2voxel = AccFlow2FrameEncoder(
+            voxel_size=voxel_size,
+            pseudo_image_dims=[grid_feature_size[0], grid_feature_size[1], grid_feature_size[2]],
+            point_cloud_range=point_cloud_range,
+            feat_channels=point_output_ch,
+            decay_factor=decay_factor,
+            timer=self.timer[1]
+        )
+        self.backbone = MinkUNet(planes, num_layer)
+
+        # Decoder - no time embedding needed
+        self.decoder_option = decoder_option
+        if decoder_option == "deflow":
+            self.flowdecoder = SparseGRUHead(voxel_feat_dim=voxel_output_ch, point_feat_dim=point_output_ch, num_iters=1)
+        else:
+            self.flowdecoder = Point_head(voxel_feat_dim=voxel_output_ch, point_feat_dim=point_output_ch)
+
+        self.voxel_spatial_shape = grid_feature_size
+        self.cnt = 0
+        self.timer.start("Total")
+
+    def load_from_checkpoint(self, ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        state_dict = {
+            k[len("model."):]: v for k, v in ckpt.items() if k.startswith("model.")
+        }
+        print("\nLoading... model weight from: ", ckpt_path, "\n")
+        return self.load_state_dict(state_dict=state_dict, strict=False)
+
+    def forward_pair(self, pc0, pc1, pose0, pose1):
+        """
+        Forward pass for a single pair of point clouds.
+
+        Args:
+            pc0: [B, N, 3] source point cloud
+            pc1: [B, M, 3] target point cloud
+            pose0: [B, 4, 4] pose of pc0
+            pose1: [B, 4, 4] pose of pc1
+
+        Returns:
+            Dictionary with flow predictions
+        """
+        # Use wrap_batch_pcs for consistent coordinate system handling (pc1 coordinate)
+        batch_dict = {
+            'pc0': pc0,
+            'pc1': pc1,
+            'pose0': pose0,
+            'pose1': pose1
+        }
+        
+        # Transform pc0 to pc1's coordinate system using standard function
+        pcs_dict = wrap_batch_pcs_future(batch_dict, num_frames=2)
+
+        # Forward through network
+        self.timer[1].start("3D Sparse Voxel")
+        sparse_dict = self.pc2voxel(pcs_dict)
+        self.timer[1].stop()
+
+        self.timer[3].start("3D Network")
+        backbone_res = self.backbone(sparse_dict['delta_sparse'])
+        pc0_3dvoxel_infos_lst = sparse_dict['pc0_3dvoxel_infos_lst']
+        pc1_3dvoxel_infos_lst = sparse_dict['pc1_3dvoxel_infos_lst']
+        self.timer[3].stop()
+
+        self.timer[4].start("Flow Decoder")
+        flows = self.flowdecoder(backbone_res, pc0_3dvoxel_infos_lst, sparse_dict['pc0_point_feats_lst'])
+        self.timer[4].stop()
+
+        return {
+            "flow": flows,
+            "pose_flow": pcs_dict['pose_flows'],
+            "pc0_valid_point_idxes": [e["point_idxes"] for e in pc0_3dvoxel_infos_lst],
+            "pc0_points_lst": [e["points"] for e in pc0_3dvoxel_infos_lst],
+            "pc1_valid_point_idxes": [e["point_idxes"] for e in pc1_3dvoxel_infos_lst],
+            "pc1_points_lst": [e["points"] for e in pc1_3dvoxel_infos_lst],
+            "d_num_voxels": [sparse_dict['d_num_voxels']],
+        }
+
+    def _sample_num_accumulate_steps(self):
+        """Sample number of accumulation steps based on probability."""
+        if self.accumulate_probs is None:
+            return self.num_frames - 1
+
+        import random
+        r = random.random()
+        cumsum = 0.0
+        for i, prob in enumerate(self.accumulate_probs):
+            cumsum += prob
+            if r < cumsum:
+                return i + 1
+        return len(self.accumulate_probs)
+
+    def forward_accumulated_error(self, batch):
+        """
+        Training forward with accumulated error using sliding window.
+
+        Process:
+        1. Predict F0: forward(pc0, pc1) -> flow_0
+        2. Warp: pc0' = pc0 + flow_0
+        3. For t = 1 to num_acc_steps-1:
+           a. Predict F_t: forward(pc_t, pc_{t+1}) -> flow_t
+           b. Interpolate flow_t to pc0' positions using KNN
+           c. Accumulate: pc0' = pc0' + interpolated_flow_t
+        4. Compare pc0' with pc_{num_acc_steps} using chamfer distance
+        """
+        batch_size = len(batch['pose0'])
+        device = batch['pc0'].device
+
+        num_acc_steps = self._sample_num_accumulate_steps()
+        max_steps = self.num_frames - 1
+        num_acc_steps = min(num_acc_steps, max_steps)
+
+        # Transform ALL frames to pc1 coordinate system ONCE
+        # This ensures all operations happen in the same coordinate system
+        pcs_dict_all = wrap_batch_pcs_future(batch, num_frames=num_acc_steps + 1)
+
+        # Step 1: Predict flow for pc0 -> pc1
+        # Build pcs_dict for encoder (needs pc0s and pc1s)
+        pcs_dict_0 = {
+            'pc0s': pcs_dict_all['pc0s'],
+            'pc1s': pcs_dict_all['pc1s'],
+            'pose_flows': pcs_dict_all['pose_flows']
+        }
+        
+        # Forward through network
+        self.timer[1].start("3D Sparse Voxel")
+        sparse_dict_0 = self.pc2voxel(pcs_dict_0)
+        self.timer[1].stop()
+
+        self.timer[3].start("3D Network")
+        backbone_res_0 = self.backbone(sparse_dict_0['delta_sparse'])
+        pc0_3dvoxel_infos_lst = sparse_dict_0['pc0_3dvoxel_infos_lst']
+        self.timer[3].stop()
+
+        self.timer[4].start("Flow Decoder")
+        flows_0 = self.flowdecoder(backbone_res_0, pc0_3dvoxel_infos_lst, sparse_dict_0['pc0_point_feats_lst'])
+        self.timer[4].stop()
+        
+        valid_idxes_0 = [e["point_idxes"] for e in pc0_3dvoxel_infos_lst]
+
+        # Initialize accumulated positions and flows
+        accumulated_positions = []
+        accumulated_flows = []
+        all_valid_idxes = []
+        all_pc0_points = []
+
+        for b in range(batch_size):
+            flow_0 = flows_0[b]
+            valid_idx_0 = valid_idxes_0[b]
+            
+            # pc0 is already in pc1 coordinate from wrap_batch_pcs_future
+            pc0_in_pc1_coord = pcs_dict_all['pc0s'][b]
+            valid_mask = ~torch.isnan(pc0_in_pc1_coord[:, 0])
+            pc0_valid = pc0_in_pc1_coord[valid_mask]
+
+            # Only track points that went through network
+            pc0_tracked = pc0_valid[valid_idx_0]
+            accumulated_pos = pc0_tracked + flow_0
+            accumulated_flow = flow_0.clone()
+
+            accumulated_positions.append(accumulated_pos)
+            accumulated_flows.append(accumulated_flow)
+            all_valid_idxes.append(valid_idx_0)
+            all_pc0_points.append(pc0_tracked)
+
+        # Step 2-3: Iterate through remaining frame pairs
+        # All frames are already in pc1 coordinate system from pcs_dict_all
+        for t in range(1, num_acc_steps):
+            pc_t_key = f'pc{t}s'
+            pc_t1_key = f'pc{t+1}s'
+
+            if pc_t_key not in pcs_dict_all or pc_t1_key not in pcs_dict_all:
+                break
+
+            # Build pcs_dict for this frame pair (both already in pc1 coordinate)
+            pcs_dict_t = {
+                'pc0s': pcs_dict_all[pc_t_key],  # pc_t in pc1 coord
+                'pc1s': pcs_dict_all[pc_t1_key],  # pc_{t+1} in pc1 coord
+            }
+            
+            # Forward through network
+            sparse_dict_t = self.pc2voxel(pcs_dict_t)
+            backbone_res_t = self.backbone(sparse_dict_t['delta_sparse'])
+            pc_t_3dvoxel_infos_lst = sparse_dict_t['pc0_3dvoxel_infos_lst']
+            flows_t = self.flowdecoder(backbone_res_t, pc_t_3dvoxel_infos_lst, sparse_dict_t['pc0_point_feats_lst'])
+            
+            valid_idxes_t = [e["point_idxes"] for e in pc_t_3dvoxel_infos_lst]
+
+            # KNN interpolation for each sample
+            # All points are in pc1 coordinate system, so we can directly compute distances
+            for b in range(batch_size):
+                accumulated_pos = accumulated_positions[b]
+                accumulated_flow = accumulated_flows[b]
+
+                # Get pc_t in pc1 coordinate (already transformed)
+                pc_t_in_pc1_coord = pcs_dict_all[pc_t_key][b]
+                valid_mask_t = ~torch.isnan(pc_t_in_pc1_coord[:, 0])
+                pc_t_valid = pc_t_in_pc1_coord[valid_mask_t]
+
+                flow_t = flows_t[b]
+                valid_idx_t = valid_idxes_t[b]
+                pc_t_tracked = pc_t_valid[valid_idx_t]
+
+                # Both accumulated_pos and pc_t_tracked are in pc1 coordinate
+                if accumulated_pos.shape[0] > 0 and pc_t_tracked.shape[0] > 0:
+                    interpolated_flow = interpolate_flow(
+                        accumulated_pos, pc_t_tracked, flow_t,
+                        method=self.interpolation_method,
+                        k=self.knn_k
+                    )
+
+                    # Update position and flow (all in pc1 coordinate)
+                    accumulated_positions[b] = accumulated_pos + interpolated_flow
+                    accumulated_flows[b] = accumulated_flow + interpolated_flow
+
+        # Package results
+        final_accumulated_flows = []
+        for b in range(batch_size):
+            final_accumulated_flows.append(accumulated_flows[b])
+
+        result = {
+            "flow": final_accumulated_flows,
+            "pose_flow": pcs_dict_all['pose_flows'],
+            "pc0_valid_point_idxes": all_valid_idxes,
+            "pc0_points_lst": all_pc0_points,
+            "accumulated_target_frame": num_acc_steps,
+            "d_num_voxels": [0],
+        }
+
+        return result
+
+    def forward(self, batch, training_mode: bool = False):
+        """
+        Main forward pass.
+
+        Args:
+            batch: Batch from dataloader
+            training_mode: If True, use accumulated error training
+
+        Returns:
+            Model output dictionary
+        """
+        self.cnt += 1
+
+        if training_mode and self.num_frames > 2:
+            return self.forward_accumulated_error(batch)
+        else:
+            # Standard 2-frame inference using wrap_batch_pcs
+            pcs_dict = wrap_batch_pcs(batch, num_frames=2)
+            
+            # Forward through network
+            self.timer[1].start("3D Sparse Voxel")
+            sparse_dict = self.pc2voxel(pcs_dict)
+            self.timer[1].stop()
+
+            self.timer[3].start("3D Network")
+            backbone_res = self.backbone(sparse_dict['delta_sparse'])
+            pc0_3dvoxel_infos_lst = sparse_dict['pc0_3dvoxel_infos_lst']
+            pc1_3dvoxel_infos_lst = sparse_dict['pc1_3dvoxel_infos_lst']
+            self.timer[3].stop()
+
+            self.timer[4].start("Flow Decoder")
+            flows = self.flowdecoder(backbone_res, pc0_3dvoxel_infos_lst, sparse_dict['pc0_point_feats_lst'])
+            self.timer[4].stop()
+
+            return {
+                "flow": flows,
+                "pose_flow": pcs_dict['pose_flows'],
+                "pc0_valid_point_idxes": [e["point_idxes"] for e in pc0_3dvoxel_infos_lst],
+                "pc0_points_lst": [e["points"] for e in pc0_3dvoxel_infos_lst],
+                "pc1_valid_point_idxes": [e["point_idxes"] for e in pc1_3dvoxel_infos_lst],
+                "pc1_points_lst": [e["points"] for e in pc1_3dvoxel_infos_lst],
+                "d_num_voxels": [sparse_dict['d_num_voxels']],
+            }
+
+
+class AccFlow2FrameEncoder(nn.Module):
+    """
+    Simple 2-frame encoder without time embedding.
+    Similar to DeltaFlow's SparseVoxelNet but optimized for AccFlow2Frame.
+    """
+
+    def __init__(self, voxel_size, pseudo_image_dims, point_cloud_range,
+                 feat_channels: int, decay_factor=1.0, timer=None) -> None:
+        super().__init__()
+
+        self.voxelizer = DynamicVoxelizer(voxel_size=voxel_size,
+                                          point_cloud_range=point_cloud_range)
+        self.feature_net = DynamicPillarFeatureNet(
+            in_channels=3,
+            feat_channels=(feat_channels,),
+            point_cloud_range=point_cloud_range,
+            voxel_size=voxel_size,
+            mode='avg')
+
+        self.voxel_spatial_shape = pseudo_image_dims
+        self.num_feature = feat_channels
+        self.decay_factor = decay_factor
+
+        if timer is None:
+            self.timer = dztimer.Timing()
+            self.timer.start("Total")
+        else:
+            self.timer = timer
+
+    def process_batch(self, voxel_info_list, if_return_point_feats=False):
+        """Process voxel info list to get features."""
+        voxel_feats_list_batch = []
+        voxel_coors_list_batch = []
+        point_feats_lst = []
+
+        for batch_index, voxel_info_dict in enumerate(voxel_info_list):
+            points = voxel_info_dict['points']
+            coordinates = voxel_info_dict['voxel_coords']
+            voxel_feats, voxel_coors, point_feats = self.feature_net(points, coordinates)
+
+            if if_return_point_feats:
+                point_feats_lst.append(point_feats)
+
+            batch_indices = torch.full((voxel_coors.size(0), 1), batch_index, dtype=torch.long, device=voxel_coors.device)
+            voxel_coors_batch = torch.cat([batch_indices, voxel_coors[:, [2, 1, 0]]], dim=1)
+            voxel_feats_list_batch.append(voxel_feats)
+            voxel_coors_list_batch.append(voxel_coors_batch)
+
+        voxel_feats_sp = torch.cat(voxel_feats_list_batch, dim=0)
+        coors_batch_sp = torch.cat(voxel_coors_list_batch, dim=0).to(dtype=torch.int32)
+
+        if if_return_point_feats:
+            return voxel_feats_sp, coors_batch_sp, point_feats_lst
+        return voxel_feats_sp, coors_batch_sp
+
+    def forward(self, pcs_dict) -> torch.Tensor:
+        """
+        Forward pass for 2-frame input.
+
+        Args:
+            pcs_dict: Dictionary with 'pc0s' and 'pc1s'
+
+        Returns:
+            Dictionary with sparse features
+        """
+        self.timer[0].start("A_Voxelization")
+        pc0_voxel_info_list = self.voxelizer(pcs_dict['pc0s'])
+        pc1_voxel_info_list = self.voxelizer(pcs_dict['pc1s'])
+        self.timer[0].stop()
+
+        self.timer[1].start("B_Pillar_Feature")
+        pc0_voxel_feats_sp, pc0_coors_batch_sp, pc0_point_feats_lst = self.process_batch(
+            pc0_voxel_info_list, if_return_point_feats=True)
+        pc1_voxel_feats_sp, pc1_coors_batch_sp = self.process_batch(pc1_voxel_info_list)
+        self.timer[1].stop()
+
+        bz_ = pcs_dict['pc0s'].shape[0]
+        sparse_max_size = [bz_, *self.voxel_spatial_shape, self.num_feature]
+        sparse_pc0 = torch.sparse_coo_tensor(pc0_coors_batch_sp.t(), pc0_voxel_feats_sp, size=sparse_max_size)
+        sparse_pc1 = torch.sparse_coo_tensor(pc1_coors_batch_sp.t(), pc1_voxel_feats_sp, size=sparse_max_size)
+
+        # Delta features (pc1 - pc0)
+        self.timer[2].start("D_Delta_Sparse")
+        sparse_diff = sparse_pc1 - sparse_pc0
+        features = sparse_diff.coalesce().values()
+        indices = sparse_diff.coalesce().indices().t().to(dtype=torch.int32)
+
+        all_pcdiff_sparse = spconv.SparseConvTensor(
+            features.contiguous(), indices.contiguous(),
+            self.voxel_spatial_shape, bz_
+        )
+        self.timer[2].stop()
+
+        output = {
+            'delta_sparse': all_pcdiff_sparse,
+            'pc0_3dvoxel_infos_lst': pc0_voxel_info_list,
+            'pc0_point_feats_lst': pc0_point_feats_lst,
+            'pc0_num_voxels': pc0_voxel_feats_sp.shape[0],
+            'pc1_3dvoxel_infos_lst': pc1_voxel_info_list,
+            'pc1_num_voxels': pc1_voxel_feats_sp.shape[0],
+            'd_num_voxels': indices.shape[0],
+        }
+        return output
