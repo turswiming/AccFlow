@@ -46,6 +46,7 @@ from dataprocess.misc_data import create_reading_index, check_h5py_file_exists
 from src.utils.av2_eval import read_ego_SE3_sensor
 
 BOUNDING_BOX_EXPANSION: Final = 0.2
+BLEED: Final = 0.2  # For instance segmentation box expansion
 CATEGORY_TO_INDEX: Final = {
     **{"NONE": 0},
     **{k.value: i + 1 for i, k in enumerate(AnnotationCategories)},
@@ -109,6 +110,62 @@ def read_pose_pc_ground(data_dir: Path, log_id: str, timestamp: int, avm: Argove
     # NOTE(SeFlow): transform to sensor coordinate, since some ray-casting based methods need sensor coordinate
     pc = ego2sensor_pose.inverse().transform_point_cloud(pc) 
     return pc, lidar_id, lidar_dt, pose, is_ground
+
+def compute_instance_ids(
+    points_sensor: np.ndarray, 
+    cuboids: dict, 
+    pose_ego: SE3,
+    ego2sensor_pose: SE3
+) -> np.ndarray:
+    """
+    Compute per-point instance ids via point-in-box using cuboids' poses and sizes.
+    Reference: argoverse_box_annotations.py _compute_instance_ids
+    
+    Note: cuboid.dst_SE3_object is in ego frame, but points_sensor is in sensor frame.
+    We need to transform box pose to sensor frame to match the point cloud coordinate.
+    
+    Args:
+        points_sensor: Nx3 array of points in sensor coordinate frame
+        cuboids: dict mapping track_uuid to Cuboid objects for this timestamp
+        pose_ego: SE3 pose of ego vehicle in city frame (not used, kept for compatibility)
+        ego2sensor_pose: SE3 transform from ego frame to sensor frame
+    
+    Returns:
+        instance_ids: Nx1 array of instance ids (-1 for background)
+    """
+    num_points = len(points_sensor)
+    instance_ids = np.full((num_points,), fill_value=-1, dtype=np.int16)
+    
+    if len(cuboids) == 0 or num_points == 0:
+        return instance_ids
+    
+    # Map track_uuid to stable small integer ids
+    track_to_id: dict[str, int] = {}
+    next_id = 0
+    for track_uuid in cuboids.keys():
+        if track_uuid not in track_to_id:
+            track_to_id[track_uuid] = next_id
+            next_id += 1
+    
+    # For each cuboid, compute mask of points inside oriented box
+    # Transform box pose from ego frame to sensor frame to match point cloud coordinate
+    for track_uuid, cuboid in cuboids.items():
+        # Create a copy and transform box pose to sensor frame
+        cuboid_expanded = deepcopy(cuboid)
+        # Transform box pose from ego frame to sensor frame
+        box_pose_sensor = ego2sensor_pose.inverse().compose(cuboid_expanded.dst_SE3_object)
+        cuboid_expanded.dst_SE3_object = box_pose_sensor
+        
+        # Add BLEED to box dimensions
+        cuboid_expanded.length_m += BLEED * 2
+        cuboid_expanded.width_m += BLEED * 2
+        cuboid_expanded.height_m += BLEED * 2
+        
+        obj_pts, obj_mask = cuboid_expanded.compute_interior_points(points_sensor)
+        if obj_mask.any():
+            instance_ids[obj_mask] = track_to_id[track_uuid]
+    
+    return instance_ids
 
 def compute_sceneflow(data_dir: Path, log_id: str, timestamps: Tuple[int, int], dclass) -> Dict[str, Union[np.ndarray, SE3]]:
     """Compute sceneflow between the sweeps at the given timestamps.
@@ -222,13 +279,15 @@ def compute_sceneflow(data_dir: Path, log_id: str, timestamps: Tuple[int, int], 
 
 def process_log(data_dir: Path, log_id: str, output_dir: Path, n: Optional[int] = None) :
 
-    def create_group_data(group, pc, pc_id, pc_dt, gm, pose, flow_0to1=None, flow_valid=None, flow_category=None, flow_instance=None, ego_motion=None):
+    def create_group_data(group, pc, pc_id, pc_dt, gm, pose, flow_0to1=None, flow_valid=None, flow_category=None, flow_instance=None, ego_motion=None, instance_label=None):
         group.create_dataset('lidar', data=pc.astype(np.float32))
         group.create_dataset('ground_mask', data=gm.astype(bool))
         group.create_dataset('pose', data=pose.astype(np.float32))
         # lidar_id for visualization and lidar_dt for HiMo mainly: 
         group.create_dataset('lidar_id', data=pc_id.astype(np.uint8)) # sensor id
         group.create_dataset('lidar_dt', data=pc_dt.astype(np.float32)) # deltaT
+        if instance_label is not None:
+            group.create_dataset('instance_label', data=instance_label.astype(np.int16))
         if flow_0to1 is not None:
             # ground truth flow information
             group.create_dataset('flow', data=flow_0to1.astype(np.float32))
@@ -251,8 +310,22 @@ def process_log(data_dir: Path, log_id: str, output_dir: Path, n: Optional[int] 
 
     
     gt_flow_flag = False if not (data_dir / log_id / "annotations.feather").exists() else True
-    if check_h5py_file_exists(output_dir/f'{log_id}.h5', timestamps):
-        return
+    # Remove existing file to allow reprocessing (for instance label updates)
+    output_file = output_dir/f'{log_id}.h5'
+    if output_file.exists():
+        output_file.unlink()
+    
+    # Load annotations for instance segmentation
+    annotations_feather_path = data_dir / log_id / "annotations.feather"
+    timestamp_cuboid_index = {}
+    if annotations_feather_path.exists():
+        cuboid_list = CuboidList.from_feather(annotations_feather_path)
+        raw_data = read_feather(annotations_feather_path)
+        ids = raw_data.track_uuid.to_numpy()
+        timestamp_cuboid_index = defaultdict(dict)
+        for id, cuboid in zip(ids, cuboid_list.cuboids):
+            timestamp_cuboid_index[cuboid.timestamp_ns][id] = cuboid
+    
     # if n is not None:
     #     iter_bar = tqdm(zip(timestamps, timestamps[1:]), leave=False,
     #                      total=len(timestamps) - 1, position=n,
@@ -267,14 +340,23 @@ def process_log(data_dir: Path, log_id: str, output_dir: Path, n: Optional[int] 
             if pc0.shape[0] < 256:
                 print(f'{log_id}/{ts0} has less than 256 points, skip this scenarios. Please check the data if needed.')
                 break
+            
+            # Compute instance labels for this timestamp
+            cuboids_ts0 = timestamp_cuboid_index.get(ts0, {})
+            # pc0 is in sensor frame, but cuboid.dst_SE3_object is in ego frame
+            # Need to get ego2sensor transform to convert box pose to sensor frame
+            ego2sensor_pose = read_ego_SE3_sensor((data_dir / log_id))['up_lidar']
+            instance_label = compute_instance_ids(pc0, cuboids_ts0, pose0, ego2sensor_pose)
+            
             if cnt == len(timestamps) - 1 or not gt_flow_flag:
-                create_group_data(group, pc0, lidar_id0, lidar_dt0, is_ground_0.astype(np.bool_), pose0.transform_matrix.astype(np.float32))
+                create_group_data(group, pc0, lidar_id0, lidar_dt0, is_ground_0.astype(np.bool_), pose0.transform_matrix.astype(np.float32),
+                                  instance_label=instance_label)
             else:
                 ts1 = timestamps[cnt + 1]
                 scene_flow = compute_sceneflow(data_dir, log_id, (ts0, ts1), dclass)
                 create_group_data(group, pc0, lidar_id0, lidar_dt0, is_ground_0.astype(np.bool_), pose0.transform_matrix.astype(np.float32),
                                   scene_flow['flow_0_1'], scene_flow['valid_0'], scene_flow['classes_0'], scene_flow['instances'],
-                                  scene_flow['ego_motion'].transform_matrix.astype(np.float32))
+                                  scene_flow['ego_motion'].transform_matrix.astype(np.float32), instance_label=instance_label)
 
 def proc(x, ignore_current_process=False):
     if not ignore_current_process:
@@ -311,21 +393,28 @@ def process_logs(data_dir: Path, output_dir: Path, nproc: int):
             res = list(tqdm(p.imap_unordered(proc, args), total=len(logs), ncols=120))
 
 def main(
-    argo_dir: str = "/home/kin/data/av2",
-    output_dir: str ="/home/kin/data/av2/preprocess",
-    av2_type: str = "sensor",
+    argo_dir: str = "/workspace/av2data",
+    output_dir: str ="/workspace/seg_val",
+    av2_type: str = "",
     data_mode: str = "val",
-    mask_dir: str = "/home/kin/data/av2/3d_scene_flow",
+    mask_dir: str = "/workspace",
     nproc: int = (multiprocessing.cpu_count() - 1),
     only_index: bool = False,
 ):
-    data_root_ = Path(argo_dir) / av2_type/ data_mode
-    output_dir_ = Path(output_dir) / av2_type / data_mode
+    if av2_type:
+        data_root_ = Path(argo_dir) / av2_type / data_mode
+        output_dir_ = Path(output_dir) / av2_type / data_mode
+    else:
+        data_root_ = Path(argo_dir) / data_mode
+        output_dir_ = Path(output_dir)
     if only_index:
         create_reading_index(output_dir_)
         return
     output_dir_.mkdir(exist_ok=True, parents=True)
     process_logs(data_root_, output_dir_, nproc)
+    # Wait a bit to ensure all files are fully written and closed
+    print("Waiting for all files to be fully written...")
+    time.sleep(5)
     create_reading_index(output_dir_)
     if data_mode == "val" or data_mode == "test":
         create_eval_mask(data_mode, output_dir_, mask_dir)
