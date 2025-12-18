@@ -152,7 +152,7 @@ class ModelWrapper(LightningModule):
                 valid_mask_target = ~torch.isnan(pc_target_raw[:, 0])
                 pc_target_raw = pc_target_raw[valid_mask_target]
 
-                # Transform pc_target from its coordinate system to pc0's coordinate system
+                # Transform pc_target from its coordinate system to pc1's coordinate system
                 # This ensures pc0 and pc_target are in the same coordinate for chamfer distance
                 pose_target_to_1 = cal_pose0to1(batch[target_pose_key][batch_id], batch["pose1"][batch_id])
                 pc_target = pc_target_raw @ pose_target_to_1[:3, :3].T + pose_target_to_1[:3, 3]
@@ -176,7 +176,7 @@ class ModelWrapper(LightningModule):
 
                 # Normalize loss by accumulation steps to keep gradient magnitude consistent
                 # This prevents larger gradients when using more accumulation steps
-                chamfer_loss_scale = 1.0 / target_frame_idx  # target_frame_idx = number of accumulation steps
+                chamfer_loss_scale = 1.0 #/ target_frame_idx  # target_frame_idx = number of accumulation steps
 
                 for i, loss_name in enumerate(loss_items):
                     if loss_name in res_loss:

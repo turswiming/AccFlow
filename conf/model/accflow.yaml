@@ -1,24 +1,26 @@
 name: accflow
 
+# num_frames controls input sequence length:
+# - num_frames=2: pc0, pc1 only (no history)
+# - num_frames=3: pc0, pc1, pch1 (1 history frame)
+# - num_frames=5: pc0, pc1, pch1, pch2, pch3 (3 history frames)
+# For inference: requires history frames + pc0 + pc1
+# For accumulated training: also requires future frames pc2, pc3, ...
+
 target:
   _target_: src.models.AccFlow
   voxel_size: ${voxel_size}
   point_cloud_range: ${point_cloud_range}
   num_frames: ${num_frames}
-  planes: [16, 32, 64, 128, 256, 256, 128, 64, 32, 16] # 1st is #input channel, last is #output channel
-  num_layer: [2, 2, 2, 2, 2, 2, 2, 2, 2] # MinkUnet 18
-  decay_factor: 0.4
-  decoder_option: time_aware # choices: [default, deflow, time_aware]
-  knn_k: 3 # k for KNN interpolation in accumulated error training
-  interpolation_method: knn # choices: [knn, three_nn, rbf, idw]
+  planes: [16, 32, 64, 128, 256, 256, 128, 64, 32, 16]
+  num_layer: [2, 2, 2, 2, 2, 2, 2, 2, 2]
+  decay_factor: 0.9  # 自监督案例为啥用0.9? TeFlow 也是0.9? 不知道，试试吧。
+  decoder_option: deflow  # choices: [default, deflow]
+  knn_k: 3
+  interpolation_method: knn  # choices: [knn, three_nn, rbf, idw]
   # Probability distribution for number of accumulation steps during training
   # [p1, p2, p3, p4] where pi = probability of accumulating i steps
-  # e.g., [0.5, 0.25, 0.125, 0.125] means:
-  #   50%   -> 1 step  (only pc0->pc1)
-  #   25%   -> 2 steps (pc0->pc1->pc2)
-  #   12.5% -> 3 steps (pc0->pc1->pc2->pc3)
-  #   12.5% -> 4 steps (pc0->pc1->pc2->pc3->pc4)
-  # Set to null for always using full accumulation (num_frames-1 steps)
-  accumulate_probs: [0.5, 0.25, 0.125, 0.125]
+  # Set to null for standard training without accumulated error
+  accumulate_probs: [0.5, 0.25, 0.125, 0.0625, 0.0625]
 
 val_monitor: val/Dynamic/Mean

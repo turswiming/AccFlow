@@ -201,7 +201,7 @@ def accflowLoss(res_dict, timer=None):
     - pc0: source point cloud [N, 3]
     - pc_target: target point cloud (final frame) [M, 3]
     - est_flow: accumulated flow from pc0 [N, 3]
-    - pc0_labels (optional): dynamic labels for pc0
+    - pc0_labels (optional): dynamic labels for pc0 (label > 1 = cluster id, used for small object weighting)
     - pc_target_labels (optional): dynamic labels for target frame
     """
     pc0 = res_dict['pc0']
@@ -211,8 +211,36 @@ def accflowLoss(res_dict, timer=None):
     # Warped pc0 using accumulated flow
     pseudo_pc_target = pc0 + est_flow
 
+    # Compute per-point small object weight based on cluster bbox area
+    # pc0_labels: 0 = static, 1 = dynamic without cluster, >1 = cluster id
+    small_obj_weight = torch.ones(pc0.shape[0], device=pc0.device)
+    if 'pc0_labels' in res_dict:
+        pc0_label = res_dict['pc0_labels']
+        unique_labels = torch.unique(pc0_label)
+        for label in unique_labels:
+            if label <= 1:  # Skip static (0) and unclustered dynamic (1)
+                continue
+            inst_mask = pc0_label == label
+            inst_points = pc0[inst_mask]
+            if inst_points.shape[0] < 3:
+                continue
+            # Compute bbox area (x * y)
+            x_range = inst_points[:, 0].max() - inst_points[:, 0].min()
+            y_range = inst_points[:, 1].max() - inst_points[:, 1].min()
+            bbox_area = x_range * y_range
+            # Apply 1.5x weight for small objects (bbox_area < 7.5)
+            if bbox_area < 7.5:
+                small_obj_weight[inst_mask] = 1.2
+
     # Main loss: Chamfer distance between warped pc0 and real target
-    chamfer_dis = MyCUDAChamferDis(pseudo_pc_target, pc_target, truncate_dist=TRUNCATED_DIST)
+    # Use weighted chamfer distance for small objects
+    raw_dist0, raw_dist1, _, _ = MyCUDAChamferDis.disid_res(pseudo_pc_target, pc_target)
+    # Apply truncation
+    raw_dist0 = torch.clamp(raw_dist0, max=TRUNCATED_DIST)
+    raw_dist1 = torch.clamp(raw_dist1, max=TRUNCATED_DIST)
+    # Apply small object weight to pc0 side
+    weighted_dist0 = raw_dist0 * small_obj_weight
+    chamfer_dis = weighted_dist0.mean() + raw_dist1.mean()
 
     # Optional: dynamic-specific losses if labels are provided
     dynamic_chamfer_dis = torch.tensor(0.0, device=est_flow.device)
@@ -229,12 +257,17 @@ def accflowLoss(res_dict, timer=None):
         have_dynamic_cluster = (pc0_dynamic.shape[0] > 256) & (pc_target_dynamic.shape[0] > 256)
 
         if have_dynamic_cluster:
-            # Dynamic chamfer distance
-            dynamic_chamfer_dis = MyCUDAChamferDis(
-                pseudo_pc_target[pc0_label > 0],
-                pc_target_dynamic,
-                truncate_dist=TRUNCATED_DIST
+            # Dynamic chamfer distance with small object weight
+            dynamic_mask = pc0_label > 0
+            dynamic_raw_dist0, dynamic_raw_dist1, _, _ = MyCUDAChamferDis.disid_res(
+                pseudo_pc_target[dynamic_mask],
+                pc_target_dynamic
             )
+            dynamic_raw_dist0 = torch.clamp(dynamic_raw_dist0, max=TRUNCATED_DIST)
+            dynamic_raw_dist1 = torch.clamp(dynamic_raw_dist1, max=TRUNCATED_DIST)
+            # Apply small object weight
+            dynamic_weighted_dist0 = dynamic_raw_dist0 * small_obj_weight[dynamic_mask]
+            dynamic_chamfer_dis = dynamic_weighted_dist0.mean() + dynamic_raw_dist1.mean()
 
         # Static flow should be small (ego-motion compensated)
         static_mask = pc0_label == 0
@@ -244,14 +277,14 @@ def accflowLoss(res_dict, timer=None):
         # Cluster consistency loss: same cluster should have similar flow
         # Similar to SeFlow's cluster_based_pc0pc1
         unique_labels = torch.unique(pc0_label)
-        raw_dist0, raw_dist1, raw_idx0, _ = MyCUDAChamferDis.disid_res(pc0, pc_target)
+        raw_chamfer_dist0, raw_chamfer_dist1, raw_idx0, _ = MyCUDAChamferDis.disid_res(pc0, pc_target)
         moved_cluster_norms = torch.tensor([], device=est_flow.device)
 
         for label in unique_labels:
             if label > 1 and have_dynamic_cluster:  # label > 1 means dynamic with valid cluster id
                 mask = pc0_label == label
                 cluster_id_flow = est_flow[mask, :]
-                cluster_nnd = raw_dist0[mask]
+                cluster_nnd = raw_chamfer_dist0[mask]
 
                 if cluster_nnd.shape[0] <= 0:
                     continue
@@ -278,7 +311,7 @@ def accflowLoss(res_dict, timer=None):
         if moved_cluster_norms.shape[0] > 0:
             cluster_loss = moved_cluster_norms.mean()
         elif have_dynamic_cluster:
-            cluster_loss = torch.mean(raw_dist0[raw_dist0 <= TRUNCATED_DIST]) + torch.mean(raw_dist1[raw_dist1 <= TRUNCATED_DIST])
+            cluster_loss = torch.mean(raw_chamfer_dist0[raw_chamfer_dist0 <= TRUNCATED_DIST]) + torch.mean(raw_chamfer_dist1[raw_chamfer_dist1 <= TRUNCATED_DIST])
 
     res_loss = {
         'chamfer_dis': chamfer_dis,

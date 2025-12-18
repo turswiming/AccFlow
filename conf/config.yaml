@@ -13,12 +13,12 @@ train_aug: False # involved by deltaflow
 val_data: /workspace/preprocess_step1/preprocess_step1/sensor/val
 output: ${model.name}-${slurm_id}
 
-checkpoint: /workspace/OpenSceneFlow/logs/jobs/accflow-accflow2frame-0/12-09-02-47/checkpoints/last.ckpt
+checkpoint: 
 pretrained_weights: 
 eval_only: False
 
 # trainer
-num_workers: 16
+num_workers: 4
 gpus: 1 # will change in code: torch.cuda.device_count()
 sync_bn: true
 batch_size: 1

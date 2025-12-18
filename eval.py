@@ -20,7 +20,7 @@ from hydra.core.hydra_config import HydraConfig
 from src.dataset import HDF5Dataset
 from src.trainer import ModelWrapper
 from src.utils import InlineTee
-from src.dataset import HDF5Dataset, HDF5DatasetFutureFrames, collate_fn_pad, ToTensor
+from src.dataset import HDF5Dataset, HDF5DatasetAccFlow, collate_fn_pad, ToTensor
 from torchvision import transforms
 
 def precheck_cfg_valid(cfg):
@@ -75,11 +75,11 @@ def main(cfg):
     trainer = pl.Trainer(logger=logger, devices=1)
 
     # Choose dataset class based on model type
-    use_future_frames = checkpoint_params.cfg.model.name == 'accflow' or cfg.get('use_future_frames', False)
-    DatasetClass = HDF5DatasetFutureFrames if use_future_frames else HDF5Dataset
+    isAccflow = checkpoint_params.cfg.model.name == 'accflow'
+    DatasetClass = HDF5Dataset if isAccflow else HDF5Dataset
 
-    if use_future_frames:
-        print(f"---LOG[eval]: Using HDF5DatasetFutureFrames for AccFlow model evaluation")
+    if isAccflow:
+        print(f"---LOG[eval]: Using HDF5Dataset for AccFlow model evaluation")
 
     # NOTE(Qingwen): search & check: def eval_only_step_(self, batch, res_dict)
     trainer.validate(model = mymodel, \

@@ -707,6 +707,215 @@ class HDF5DatasetFutureFrames(Dataset):
             data_dict = self.transform(data_dict)
         return data_dict
 
+
+class HDF5DatasetAccFlow(Dataset):
+    """
+    HDF5Dataset variant for AccFlow that returns BOTH history frames AND future frames.
+    
+    For num_frames=5 (3 history frames):
+    - History frames: pch1, pch2, pch3 (t-1, t-2, t-3)
+    - Current frames: pc0, pc1 (t, t+1)
+    - Future frames: pc2, pc3, pc4 (t+2, t+3, t+4)
+    - Total: 8 frames
+    
+    General formula:
+    - num_history = num_frames - 2
+    - num_future = num_frames - 1 (for accumulated error training)
+    - total_frames = 2 * num_frames - 2
+    """
+    def __init__(self, directory,
+                 transform=None, n_frames=2, ssl_label=None,
+                 eval=False, leaderboard_version=1,
+                 vis_name=''):
+        '''
+        Args:
+            directory: the directory of the dataset
+            n_frames: number of frames for model (2 + num_history_frames)
+                      e.g., n_frames=5 means pc0, pc1, pch1, pch2, pch3
+                      Dataset will also return future frames pc2, pc3, pc4 for accumulated training
+            ssl_label: if set, read dynamic cluster label
+            eval: if True, use the eval index
+            leaderboard_version: 1st or 2nd
+            vis_name: data for visualization
+        '''
+        super(HDF5DatasetAccFlow, self).__init__()
+        self.directory = directory
+        self.n_frames = n_frames
+        self.history_frames = n_frames - 2  # e.g., n_frames=5 -> 3 history frames
+        self.future_frames = n_frames - 1   # e.g., n_frames=5 -> 4 steps accumulation -> need pc2,pc3,pc4
+        
+        if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or not torch.distributed.is_initialized():
+            total_frames = 2 * n_frames - 2
+            print(f"----[Debug] HDF5DatasetAccFlow: n_frames={n_frames}, history={self.history_frames}, future={self.future_frames}, total={total_frames}")
+            print(f"----[Debug] Returns: pch{self.history_frames}...pch1, pc0, pc1, pc2...pc{self.future_frames+1}")
+        
+        with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
+            self.data_index = pickle.load(f)
+
+        self.eval_index = False
+        self.ssl_label = import_func(f"src.autolabel.{ssl_label}") if ssl_label is not None else None
+        self.vis_name = vis_name if isinstance(vis_name, list) else [vis_name]
+        self.transform = transform
+
+        if eval:
+            eval_index_file = os.path.join(self.directory, 'index_eval.pkl')
+            if leaderboard_version == 2:
+                print("Using index to leaderboard version 2!!")
+                eval_index_file = os.path.join(BASE_DIR, 'assets/docs/index_eval_v2.pkl')
+
+            if not os.path.exists(eval_index_file):
+                print(f"Warning: No {eval_index_file} file found! Trying 'index_flow.pkl'")
+                eval_index_file = os.path.join(self.directory, 'index_flow.pkl')
+                if not os.path.exists(eval_index_file):
+                    raise Exception(f"No eval index file found in {self.directory}")
+            
+            self.eval_index = eval
+            with open(eval_index_file, 'rb') as f:
+                self.eval_data_index = pickle.load(f)
+
+        # Build scene bounds
+        self.scene_id_bounds = {}
+        for idx, (scene_id, timestamp) in enumerate(self.data_index):
+            if scene_id not in self.scene_id_bounds:
+                self.scene_id_bounds[scene_id] = {
+                    "min_timestamp": timestamp, "max_timestamp": timestamp,
+                    "min_index": idx, "max_index": idx
+                }
+            else:
+                bounds = self.scene_id_bounds[scene_id]
+                if timestamp < bounds["min_timestamp"]:
+                    bounds["min_timestamp"] = timestamp
+                    bounds["min_index"] = idx
+                if timestamp > bounds["max_timestamp"]:
+                    bounds["max_timestamp"] = timestamp
+                    bounds["max_index"] = idx
+        
+        self.train_index = None
+        if not eval and ssl_label is None and transform is not None:
+            one_scene_id = list(self.scene_id_bounds.keys())[0]
+            check_flow_exist = True
+            with h5py.File(os.path.join(self.directory, f'{one_scene_id}.h5'), 'r') as f:
+                for i in range(self.scene_id_bounds[one_scene_id]["min_index"], 
+                              self.scene_id_bounds[one_scene_id]["max_index"]):
+                    scene_id, timestamp = self.data_index[i]
+                    key = str(timestamp)
+                    if 'flow' not in f[key]:
+                        check_flow_exist = False
+                        break
+            if not check_flow_exist:
+                print(f"----- [Warning]: Not all frames have flow data, using index_flow.pkl instead.")
+                self.train_index = pickle.load(open(os.path.join(self.directory, 'index_flow.pkl'), 'rb'))
+
+    def __len__(self):
+        if self.eval_index:
+            return len(self.eval_data_index)
+        elif not self.eval_index and self.train_index is not None:
+            return len(self.train_index)
+        return len(self.data_index)
+
+    def valid_index(self, index_):
+        """
+        Ensure index has enough history AND future frames.
+        """
+        eval_flag = False
+        if self.eval_index:
+            eval_index_ = index_
+            scene_id, timestamp = self.eval_data_index[eval_index_]
+            index_ = self.data_index.index([scene_id, timestamp])
+            eval_flag = True
+        elif self.train_index is not None:
+            train_index_ = index_
+            scene_id, timestamp = self.train_index[train_index_]
+            index_ = self.data_index.index([scene_id, timestamp])
+        else:
+            scene_id, timestamp = self.data_index[index_]
+        
+        min_idx = self.scene_id_bounds[scene_id]["min_index"]
+        max_idx = self.scene_id_bounds[scene_id]["max_index"]
+        
+        # Need history_frames before and (future_frames + 1) after (including pc1)
+        min_valid = min_idx + self.history_frames
+        max_valid = max_idx - self.future_frames - 1  # -1 for pc1
+        
+        index_ = max(min_valid, min(max_valid, index_))
+        
+        return eval_flag, index_
+
+    def __getitem__(self, index_):
+        eval_flag, index_ = self.valid_index(index_)
+        scene_id, timestamp = self.data_index[index_]
+
+        key = str(timestamp)
+        data_dict = {
+            'scene_id': scene_id,
+            'timestamp': timestamp,
+            'eval_flag': eval_flag
+        }
+        
+        with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f:
+            min_idx = self.scene_id_bounds[scene_id]["min_index"]
+            max_idx = self.scene_id_bounds[scene_id]["max_index"]
+            
+            # ===== pc0 (current frame) =====
+            data_dict['pc0'] = f[key]['lidar'][:][:,:3]
+            data_dict['gm0'] = f[key]['ground_mask'][:]
+            data_dict['pose0'] = f[key]['pose'][:]
+            if self.ssl_label is not None:
+                data_dict['pc0_dynamic'] = self.ssl_label(f[key])
+
+            # ===== pc1 (next frame) =====
+            next_timestamp = str(self.data_index[index_ + 1][1])
+            data_dict['pc1'] = f[next_timestamp]['lidar'][:][:,:3]
+            data_dict['gm1'] = f[next_timestamp]['ground_mask'][:]
+            data_dict['pose1'] = f[next_timestamp]['pose'][:]
+            if self.ssl_label is not None:
+                data_dict['pc1_dynamic'] = self.ssl_label(f[next_timestamp])
+
+            # ===== History frames (pch1, pch2, ...) =====
+            for i in range(1, self.history_frames + 1):
+                frame_index = index_ - i
+                frame_index = max(frame_index, min_idx)
+                
+                past_timestamp = str(self.data_index[frame_index][1])
+                data_dict[f'pch{i}'] = f[past_timestamp]['lidar'][:][:,:3]
+                data_dict[f'gmh{i}'] = f[past_timestamp]['ground_mask'][:]
+                data_dict[f'poseh{i}'] = f[past_timestamp]['pose'][:]
+                
+                if i == 1 and self.ssl_label is not None:
+                    data_dict['pch1_dynamic'] = self.ssl_label(f[past_timestamp])
+
+            # ===== Future frames (pc2, pc3, pc4, ...) =====
+            for i in range(1, self.future_frames + 1):
+                frame_index = index_ + 1 + i  # pc2 is at index+2, pc3 at index+3, etc.
+                frame_index = min(frame_index, max_idx)
+                
+                future_timestamp = str(self.data_index[frame_index][1])
+                data_dict[f'pc{i+1}'] = f[future_timestamp]['lidar'][:][:,:3]
+                data_dict[f'gm{i+1}'] = f[future_timestamp]['ground_mask'][:]
+                data_dict[f'pose{i+1}'] = f[future_timestamp]['pose'][:]
+                
+                if self.ssl_label is not None:
+                    data_dict[f'pc{i+1}_dynamic'] = self.ssl_label(f[future_timestamp])
+
+            # ===== Ground truth and other data =====
+            for data_key in self.vis_name + ['ego_motion', 'flow', 'flow_is_valid', 
+                                             'flow_category_indices', 'flow_instance_id', 'dufo']:
+                if data_key in f[key]:
+                    data_dict[data_key] = f[key][data_key][:]
+
+            if self.eval_index:
+                if 'eval_mask' in f[key]:
+                    data_dict['eval_mask'] = f[key]['eval_mask'][:]
+                elif 'ground_mask' in f[key]:
+                    data_dict['eval_mask'] = ~f[key]['ground_mask'][:]
+                else:
+                    data_dict['eval_mask'] = np.ones_like(data_dict['pc0'][:, 0], dtype=np.bool_)
+
+        if self.transform:
+            data_dict = self.transform(data_dict)
+        return data_dict
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DataLoader test")
     parser.add_argument('--data_mode', '-m', type=str, default='train', metavar='N', help='Dataset mode.')

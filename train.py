@@ -13,6 +13,7 @@
 
 import signal
 import torch
+import shutil
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
@@ -24,11 +25,35 @@ from lightning.pytorch.callbacks import (
 from omegaconf import DictConfig, OmegaConf
 import hydra, wandb, os, math
 from hydra.core.hydra_config import HydraConfig
+from hydra.utils import get_original_cwd
 from pathlib import Path
 
-from src.dataset import HDF5Dataset, HDF5DatasetFutureFrames, collate_fn_pad, RandomHeight, RandomFlip, RandomJitter, ToTensor
+from src.dataset import HDF5Dataset, HDF5DatasetFutureFrames, HDF5DatasetAccFlow, collate_fn_pad, RandomHeight, RandomFlip, RandomJitter, ToTensor
 from torchvision import transforms
 from src.trainer import ModelWrapper
+
+def backup_code(source_dir, dest_dir):
+    """Backup all .py files from source_dir to dest_dir."""
+    print(f"[INFO] Backing up code from {source_dir} to {dest_dir}...")
+    source_path = Path(source_dir)
+    dest_path = Path(dest_dir)
+    
+    # Walk through all files
+    for file_path in source_path.rglob("*.py"):
+        # Get relative path to preserve structure
+        try:
+            rel_path = file_path.relative_to(source_path)
+        except ValueError:
+            continue
+        
+        # Skip if in hidden directories or build artifacts or logs/outputs
+        if any(part.startswith('.') or part in ['__pycache__', 'build', 'dist', 'wandb', 'logs', 'outputs'] for part in rel_path.parts):
+            continue
+            
+        dest_file = dest_path / rel_path
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, dest_file)
+    print(f"[INFO] Code backup completed.")
 
 def precheck_cfg_valid(cfg):
     if cfg.loss_fn in ['seflowLoss', 'seflowppLoss'] and (cfg.add_seloss is None or cfg.ssl_label is None):
@@ -66,16 +91,26 @@ def main(cfg):
     train_aug = transforms.Compose([RandomHeight(p=0.8), RandomFlip(p=0.2), RandomJitter(), ToTensor()] if cfg.get('train_aug', False) else [ToTensor()])
 
     # Choose dataset class based on model type
-    # AccFlow uses future frames dataset, others use standard dataset
-    use_future_frames = cfg.model.name in ['accflow', 'accflow2frame'] or cfg.get('use_future_frames', False)
+    # AccFlow: training uses HDF5DatasetAccFlow (history + future), validation uses HDF5Dataset (history only)
+    # Other models: use standard HDF5Dataset or HDF5DatasetFutureFrames
+    is_accflow = cfg.model.name in ['accflow', 'accflow2frame']
+    use_future_frames = cfg.get('use_future_frames', False)
 
-    if use_future_frames:
+    if is_accflow:
+        # AccFlow training needs both history and future frames
+        TrainDatasetClass = HDF5DatasetAccFlow
+        # AccFlow validation only needs history frames (same as DeltaFlow inference)
+        ValDatasetClass = HDF5Dataset
+        print(f"[INFO] AccFlow mode: Training with HDF5DatasetAccFlow (history+future), Validation with HDF5Dataset (history only)")
+    elif use_future_frames:
         print(f"[INFO] Using HDF5DatasetFutureFrames for future frame prediction")
-        DatasetClass = HDF5DatasetFutureFrames
+        TrainDatasetClass = HDF5DatasetFutureFrames
+        ValDatasetClass = HDF5DatasetFutureFrames
     else:
-        DatasetClass = HDF5Dataset
+        TrainDatasetClass = HDF5Dataset
+        ValDatasetClass = HDF5Dataset
 
-    train_dataset = DatasetClass(cfg.train_data,
+    train_dataset = TrainDatasetClass(cfg.train_data,
                     n_frames=cfg.num_frames,
                     ssl_label=cfg.get('ssl_label', None),
                     transform=train_aug)
@@ -85,7 +120,7 @@ def main(cfg):
                               num_workers=cfg.num_workers,
                               collate_fn=collate_fn_pad,
                               pin_memory=True)
-    val_loader = DataLoader(DatasetClass(cfg.val_data, \
+    val_loader = DataLoader(ValDatasetClass(cfg.val_data, \
                                 n_frames=cfg.num_frames,\
                                 eval=True,  # Enable eval_mask reading for validation
                                 transform=transforms.Compose([ToTensor()])),
@@ -111,6 +146,15 @@ def main(cfg):
     # FIXME: hydra output_dir with ddp run will mkdir in the parent folder. Looks like PL and Hydra trying to fix in lib.
     # print(f"Output Directory: {output_dir} in gpu rank: {torch.cuda.current_device()}")
     Path(os.path.join(output_dir, "checkpoints")).mkdir(parents=True, exist_ok=True)
+
+    # Backup code
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        try:
+            original_cwd = get_original_cwd()
+            backup_dir = os.path.join(output_dir, "code_backup")
+            backup_code(original_cwd, backup_dir)
+        except Exception as e:
+            print(f"[WARNING] Failed to backup code: {e}")
     
     cfg = DictConfig(OmegaConf.to_container(cfg, resolve=True))
     model = ModelWrapper(cfg)
@@ -193,7 +237,14 @@ def main(cfg):
         if cfg.get('add_seloss', None) is not None and cfg.loss_fn in ['seflowLoss', 'seflowppLoss', 'accflowLoss']:
             print(f"Note: We are in **self-supervised** training now. No ground truth label is used.")
             print(f"We will use these loss items in {cfg.loss_fn}: {cfg.add_seloss}")
-        if use_future_frames:
+        if is_accflow:
+            num_history = cfg.num_frames - 2
+            num_future = cfg.num_frames - 1
+            total_train_frames = 2 * cfg.num_frames - 2
+            print(f"Note: AccFlow with num_frames={cfg.num_frames}")
+            print(f"      Training: {total_train_frames} frames total (pch{num_history}...pch1, pc0, pc1, pc2...pc{num_future+1})")
+            print(f"      Validation: {cfg.num_frames} frames (pch{num_history}...pch1, pc0, pc1)")
+        elif use_future_frames:
             print(f"Note: Using future frames dataset with {cfg.num_frames} frames (pc0, pc1, ..., pc{cfg.num_frames-1})")
         print(f"\n[TIP] To manually save checkpoint during training, run:")
         print(f"      kill -SIGUSR1 $(pgrep -f 'python train.py')")
