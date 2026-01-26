@@ -163,6 +163,21 @@ class ModelWrapper(LightningModule):
                     'pc_target': pc_target,
                 }
 
+                # Add pch1 for bidirectional supervision (similar to SeFlow++)
+                if 'pch1' in batch:
+                    pch1_raw = batch['pch1'][batch_id]
+                    valid_mask_pch1 = ~torch.isnan(pch1_raw[:, 0])
+                    pch1_raw = pch1_raw[valid_mask_pch1]
+                    
+                    # Transform pch1 to pc1 coordinate system (same as pc0)
+                    pose_pch1_to_1 = cal_pose0to1(batch['poseh1'][batch_id], batch["pose1"][batch_id])
+                    pch1 = pch1_raw @ pose_pch1_to_1[:3, :3].T + pose_pch1_to_1[:3, 3]
+                    dict2loss['pch1'] = pch1
+                    
+                    # Get pch1 dynamic labels if available
+                    if 'pch1_dynamic' in batch:
+                        dict2loss['pch1_labels'] = batch['pch1_dynamic'][batch_id][valid_mask_pch1]
+
                 # Add dynamic labels if available
                 if 'pc0_dynamic' in batch:
                     pc0_valid_idx_batch = pc0_valid_idx[batch_id]

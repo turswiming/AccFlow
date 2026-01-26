@@ -64,6 +64,136 @@ def knn_interpolate_flow(query_points, ref_points, ref_flow, k=3):
         return interpolated_flow
 
 
+def knn_interpolate_flow_soft(query_points, ref_points, ref_flow, k=3, temperature=0.1):
+    """
+    Differentiable KNN interpolation using soft assignment.
+    
+    This version is differentiable w.r.t. query_points by using softmax
+    over distances instead of hard topk selection.
+    
+    Uses pytorch3d's CUDA-accelerated KNN when available for faster neighbor search.
+    
+    Args:
+        query_points: [N, 3] points to interpolate flow to
+        ref_points: [M, 3] reference points with known flow
+        ref_flow: [M, 3] flow vectors at reference points
+        k: number of neighbors to consider (used for efficiency, but all neighbors are weighted)
+        temperature: temperature for softmax (lower = harder, more like hard KNN)
+    
+    Returns:
+        interpolated_flow: [N, 3] interpolated flow at query points
+    """
+    # Use pytorch3d's CUDA KNN for faster neighbor search (when available and efficient)
+    if HAS_PYTORCH3D and query_points.shape[0] > 100 and k < ref_points.shape[0]:
+        # pytorch3d expects [B, N, 3] format
+        query_pts = query_points.unsqueeze(0)  # [1, N, 3]
+        ref_pts = ref_points.unsqueeze(0)  # [1, M, 3]
+        ref_f = ref_flow.unsqueeze(0)  # [1, M, 3]
+        
+        # Fast CUDA-accelerated KNN search
+        knn_result = knn_points(query_pts, ref_pts, K=k, return_sorted=False)
+        knn_dist = knn_result.dists  # [1, N, k] (squared distances)
+        knn_idx = knn_result.idx  # [1, N, k]
+        
+        # Convert squared distances to Euclidean distances for softmax
+        knn_dist_euclidean = knn_dist.sqrt()  # [1, N, k]
+        
+        # Softmax over distances (differentiable w.r.t. query_points via knn_dist)
+        weights = torch.softmax(-knn_dist_euclidean / temperature, dim=2)  # [1, N, k]
+        
+        # Gather flow values
+        knn_flow = knn_gather(ref_f, knn_idx)  # [1, N, k, 3]
+        
+        # Weighted sum
+        interpolated_flow = (weights.unsqueeze(-1) * knn_flow).sum(dim=2)  # [1, N, 3]
+        return interpolated_flow.squeeze(0)  # [N, 3]
+    
+    # Fallback: Pure PyTorch implementation
+    # Compute pairwise distances: [N, M]
+    dist = torch.cdist(query_points, ref_points)
+    
+    # Option 1: Soft assignment over top-k neighbors (more efficient)
+    if k < ref_points.shape[0]:
+        # Get top-k distances and indices
+        knn_dist, knn_idx = dist.topk(k, dim=1, largest=False)
+        # Use softmax over top-k distances (differentiable w.r.t. query_points)
+        weights = torch.softmax(-knn_dist / temperature, dim=1)  # [N, k]
+        # Gather flows
+        knn_flow = ref_flow[knn_idx]  # [N, k, 3]
+        interpolated_flow = (weights.unsqueeze(-1) * knn_flow).sum(dim=1)  # [N, 3]
+    else:
+        # Option 2: Soft assignment over all neighbors (fully differentiable)
+        # Use softmax over all distances (differentiable w.r.t. query_points)
+        weights = torch.softmax(-dist / temperature, dim=1)  # [N, M]
+        # Matrix multiplication: [N, M] @ [M, 3] = [N, 3]
+        interpolated_flow = weights @ ref_flow
+    
+    return interpolated_flow
+
+
+def knn_interpolate_flow_rbf_soft(query_points, ref_points, ref_flow, sigma=0.5, max_neighbors=None):
+    """
+    Differentiable RBF interpolation using soft assignment.
+    
+    Uses Gaussian RBF kernel with soft assignment over all neighbors.
+    Fully differentiable w.r.t. query_points.
+    
+    Uses pytorch3d's CUDA-accelerated KNN when available for faster neighbor search.
+    
+    Args:
+        query_points: [N, 3] points to interpolate flow to
+        ref_points: [M, 3] reference points with known flow
+        ref_flow: [M, 3] flow vectors at reference points
+        sigma: RBF kernel bandwidth
+        max_neighbors: if None, uses all neighbors; otherwise uses top-k for efficiency
+    
+    Returns:
+        interpolated_flow: [N, 3] interpolated flow at query points
+    """
+    # Use pytorch3d's CUDA KNN for faster neighbor search (when available and efficient)
+    if HAS_PYTORCH3D and query_points.shape[0] > 100 and max_neighbors is not None and max_neighbors < ref_points.shape[0]:
+        # pytorch3d expects [B, N, 3] format
+        query_pts = query_points.unsqueeze(0)  # [1, N, 3]
+        ref_pts = ref_points.unsqueeze(0)  # [1, M, 3]
+        ref_f = ref_flow.unsqueeze(0)  # [1, M, 3]
+        
+        # Fast CUDA-accelerated KNN search
+        knn_result = knn_points(query_pts, ref_pts, K=max_neighbors, return_sorted=False)
+        knn_dist_sq = knn_result.dists  # [1, N, k] (squared distances)
+        knn_idx = knn_result.idx  # [1, N, k]
+        
+        # RBF weights: exp(-d^2 / (2*sigma^2))
+        weights = torch.exp(-knn_dist_sq / (2 * sigma ** 2))  # [1, N, k]
+        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-8)
+        
+        # Gather flow values
+        knn_flow = knn_gather(ref_f, knn_idx)  # [1, N, k, 3]
+        
+        # Weighted sum
+        interpolated_flow = (weights.unsqueeze(-1) * knn_flow).sum(dim=2)  # [1, N, 3]
+        return interpolated_flow.squeeze(0)  # [N, 3]
+    
+    # Fallback: Pure PyTorch implementation
+    # Compute pairwise squared distances: [N, M]
+    dist_sq = torch.cdist(query_points, ref_points) ** 2
+    
+    if max_neighbors is not None and max_neighbors < ref_points.shape[0]:
+        # Use top-k for efficiency (still differentiable w.r.t. query_points)
+        knn_dist_sq, knn_idx = dist_sq.topk(max_neighbors, dim=1, largest=False)
+        # RBF weights: exp(-d^2 / (2*sigma^2))
+        weights = torch.exp(-knn_dist_sq / (2 * sigma ** 2))  # [N, k]
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
+        knn_flow = ref_flow[knn_idx]  # [N, k, 3]
+        interpolated_flow = (weights.unsqueeze(-1) * knn_flow).sum(dim=1)  # [N, 3]
+    else:
+        # Use all neighbors (fully differentiable)
+        weights = torch.exp(-dist_sq / (2 * sigma ** 2))  # [N, M]
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
+        interpolated_flow = weights @ ref_flow  # [N, 3]
+    
+    return interpolated_flow
+
+
 def three_nn_interpolate_flow(query_points, ref_points, ref_flow):
     """PointNet++ style three nearest neighbor interpolation."""
     if HAS_POINTNET_OPS:
@@ -116,14 +246,34 @@ def idw_interpolate_flow(query_points, ref_points, ref_flow, power=2, k=8):
 
 INTERPOLATION_METHODS = {
     'knn': knn_interpolate_flow,
+    'knn_soft': knn_interpolate_flow_soft,  # Differentiable version
     'three_nn': three_nn_interpolate_flow,
     'rbf': rbf_interpolate_flow,
+    'rbf_soft': knn_interpolate_flow_rbf_soft,  # Differentiable RBF version
     'idw': idw_interpolate_flow,
 }
 
 
 def interpolate_flow(query_points, ref_points, ref_flow, method='knn', **kwargs):
-    """Unified interface for flow interpolation."""
+    """
+    Unified interface for flow interpolation.
+    
+    Args:
+        query_points: [N, 3] points to interpolate flow to
+        ref_points: [M, 3] reference points with known flow
+        ref_flow: [M, 3] flow vectors at reference points
+        method: interpolation method
+            - 'knn': Hard KNN (not differentiable w.r.t. query_points)
+            - 'knn_soft': Soft KNN (differentiable w.r.t. query_points, uses temperature)
+            - 'rbf_soft': Soft RBF (differentiable w.r.t. query_points)
+            - 'three_nn', 'rbf', 'idw': other methods
+        **kwargs: method-specific parameters
+            - For 'knn_soft': k, temperature (default: 0.1)
+            - For 'rbf_soft': sigma (default: 0.5), max_neighbors (optional)
+    
+    Returns:
+        interpolated_flow: [N, 3] interpolated flow at query points
+    """
     if method not in INTERPOLATION_METHODS:
         raise ValueError(f"Unknown interpolation method: {method}. Available: {list(INTERPOLATION_METHODS.keys())}")
     return INTERPOLATION_METHODS[method](query_points, ref_points, ref_flow, **kwargs)
@@ -515,7 +665,6 @@ class AccFlow(nn.Module):
         Returns:
             Model output dictionary with flow predictions
         """
-
         # Check if accumulated training should be used
         # Requires future frames (pc2, pc3, ...) in batch
         has_future_frames = 'pc2' in batch and 'pose2' in batch

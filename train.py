@@ -28,7 +28,7 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
 from pathlib import Path
 
-from src.dataset import HDF5Dataset, HDF5DatasetFutureFrames, HDF5DatasetAccFlow, collate_fn_pad, RandomHeight, RandomFlip, RandomJitter, ToTensor
+from src.dataset import HDF5Dataset, HDF5DatasetAccFlow, collate_fn_pad, RandomHeight, RandomFlip, RandomJitter, ToTensor
 from torchvision import transforms
 from src.trainer import ModelWrapper
 
@@ -102,10 +102,6 @@ def main(cfg):
         # AccFlow validation only needs history frames (same as DeltaFlow inference)
         ValDatasetClass = HDF5Dataset
         print(f"[INFO] AccFlow mode: Training with HDF5DatasetAccFlow (history+future), Validation with HDF5Dataset (history only)")
-    elif use_future_frames:
-        print(f"[INFO] Using HDF5DatasetFutureFrames for future frame prediction")
-        TrainDatasetClass = HDF5DatasetFutureFrames
-        ValDatasetClass = HDF5DatasetFutureFrames
     else:
         TrainDatasetClass = HDF5Dataset
         ValDatasetClass = HDF5Dataset

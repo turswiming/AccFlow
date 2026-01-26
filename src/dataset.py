@@ -742,7 +742,7 @@ class HDF5DatasetAccFlow(Dataset):
         self.directory = directory
         self.n_frames = n_frames
         self.history_frames = n_frames - 2  # e.g., n_frames=5 -> 3 history frames
-        self.future_frames = n_frames - 1   # e.g., n_frames=5 -> 4 steps accumulation -> need pc2,pc3,pc4
+        self.future_frames = 4   # e.g., n_frames=5 -> 4 steps accumulation -> need pc2,pc3,pc4
         
         if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or not torch.distributed.is_initialized():
             total_frames = 2 * n_frames - 2

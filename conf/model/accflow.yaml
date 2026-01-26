@@ -14,13 +14,13 @@ target:
   num_frames: ${num_frames}
   planes: [16, 32, 64, 128, 256, 256, 128, 64, 32, 16]
   num_layer: [2, 2, 2, 2, 2, 2, 2, 2, 2]
-  decay_factor: 0.9  # 自监督案例为啥用0.9? TeFlow 也是0.9? 不知道，试试吧。
-  decoder_option: deflow  # choices: [default, deflow]
-  knn_k: 3
-  interpolation_method: knn  # choices: [knn, three_nn, rbf, idw]
+  decay_factor: 0.4  # 自监督案例为啥用0.9? TeFlow 也是0.9? 不知道，试试吧。
+  decoder_option: default  # choices: [default, deflow]
+  knn_k: 1
+  interpolation_method: knn_soft  # choices: [knn, three_nn, rbf, idw, knn_soft, rbf_soft]
   # Probability distribution for number of accumulation steps during training
   # [p1, p2, p3, p4] where pi = probability of accumulating i steps
   # Set to null for standard training without accumulated error
-  accumulate_probs: [0.5, 0.25, 0.125, 0.0625, 0.0625]
+  accumulate_probs: ${target.accumulate_probs}
 
 val_monitor: val/Dynamic/Mean

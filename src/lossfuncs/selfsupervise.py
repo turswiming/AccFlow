@@ -211,27 +211,6 @@ def accflowLoss(res_dict, timer=None):
     # Warped pc0 using accumulated flow
     pseudo_pc_target = pc0 + est_flow
 
-    # Compute per-point small object weight based on cluster bbox area
-    # pc0_labels: 0 = static, 1 = dynamic without cluster, >1 = cluster id
-    small_obj_weight = torch.ones(pc0.shape[0], device=pc0.device)
-    if 'pc0_labels' in res_dict:
-        pc0_label = res_dict['pc0_labels']
-        unique_labels = torch.unique(pc0_label)
-        for label in unique_labels:
-            if label <= 1:  # Skip static (0) and unclustered dynamic (1)
-                continue
-            inst_mask = pc0_label == label
-            inst_points = pc0[inst_mask]
-            if inst_points.shape[0] < 3:
-                continue
-            # Compute bbox area (x * y)
-            x_range = inst_points[:, 0].max() - inst_points[:, 0].min()
-            y_range = inst_points[:, 1].max() - inst_points[:, 1].min()
-            bbox_area = x_range * y_range
-            # Apply 1.5x weight for small objects (bbox_area < 7.5)
-            if bbox_area < 7.5:
-                small_obj_weight[inst_mask] = 1.2
-
     # Main loss: Chamfer distance between warped pc0 and real target
     # Use weighted chamfer distance for small objects
     raw_dist0, raw_dist1, _, _ = MyCUDAChamferDis.disid_res(pseudo_pc_target, pc_target)
@@ -239,8 +218,7 @@ def accflowLoss(res_dict, timer=None):
     raw_dist0 = torch.clamp(raw_dist0, max=TRUNCATED_DIST)
     raw_dist1 = torch.clamp(raw_dist1, max=TRUNCATED_DIST)
     # Apply small object weight to pc0 side
-    weighted_dist0 = raw_dist0 * small_obj_weight
-    chamfer_dis = weighted_dist0.mean() + raw_dist1.mean()
+    chamfer_dis = raw_dist0.mean() + raw_dist1.mean()
 
     # Optional: dynamic-specific losses if labels are provided
     dynamic_chamfer_dis = torch.tensor(0.0, device=est_flow.device)
@@ -266,8 +244,7 @@ def accflowLoss(res_dict, timer=None):
             dynamic_raw_dist0 = torch.clamp(dynamic_raw_dist0, max=TRUNCATED_DIST)
             dynamic_raw_dist1 = torch.clamp(dynamic_raw_dist1, max=TRUNCATED_DIST)
             # Apply small object weight
-            dynamic_weighted_dist0 = dynamic_raw_dist0 * small_obj_weight[dynamic_mask]
-            dynamic_chamfer_dis = dynamic_weighted_dist0.mean() + dynamic_raw_dist1.mean()
+            dynamic_chamfer_dis = dynamic_raw_dist0.mean() + dynamic_raw_dist1.mean()
 
         # Static flow should be small (ego-motion compensated)
         static_mask = pc0_label == 0
