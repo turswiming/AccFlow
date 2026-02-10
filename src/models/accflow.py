@@ -513,14 +513,17 @@ class AccFlow(nn.Module):
         # Step 1: Transform all frames to pc1 coordinate system
         all_pcs = self._transform_all_to_pc1_coord(batch, num_acc_steps)
 
-        # Step 2: First step pc0 → pc1 with original history frames
-        # All frames already in pc1 coord, so pose is identity → pose_flow = 0
+        # Step 2: Precompute all step flows first
+        flows_per_step = []
+        tracked_points_per_step = []
+        valid_idxes_per_step = []
+
+        # Step 2.1: pc0 -> pc1 with original history frames
         pcs_dict_0 = {
             'pc0s': all_pcs['pc0'],
             'pc1s': all_pcs['pc1'],
             'pose_flows': all_pcs['pose_flow_0'],
         }
-        # Add history frames (pch1, pch2, ...)
         for h in range(1, self.num_frames - 1):
             pch_key = f'pch{h}'
             if pch_key in all_pcs:
@@ -529,37 +532,23 @@ class AccFlow(nn.Module):
         self.timer[1].start("3D Sparse Voxel")
         result_0 = self._forward_network(pcs_dict_0)
         self.timer[1].stop()
-        
+
         flows_0 = result_0['flow']
         pc0_3dvoxel_infos_lst = result_0['pc0_3dvoxel_infos_lst']
         valid_idxes_0 = [e["point_idxes"] for e in pc0_3dvoxel_infos_lst]
 
-        # Initialize accumulated positions and flows
-        accumulated_positions = []
-        accumulated_flows = []
-        all_valid_idxes = []
-        all_pc0_points = []
-
+        step0_tracked = []
         for b in range(batch_size):
-            flow_0 = flows_0[b]
-            valid_idx_0 = valid_idxes_0[b]
-            
-            # pc0 is in pc1 coordinate after transformation
             pc0_in_pc1 = all_pcs['pc0'][b]
             valid_mask = ~torch.isnan(pc0_in_pc1[:, 0])
             pc0_valid = pc0_in_pc1[valid_mask]
+            step0_tracked.append(pc0_valid[valid_idxes_0[b]])
 
-            # Only track points that went through network
-            pc0_tracked = pc0_valid[valid_idx_0]
-            accumulated_pos = pc0_tracked + flow_0
-            accumulated_flow = flow_0.clone()
+        flows_per_step.append(flows_0)
+        tracked_points_per_step.append(step0_tracked)
+        valid_idxes_per_step.append(valid_idxes_0)
 
-            accumulated_positions.append(accumulated_pos)
-            accumulated_flows.append(accumulated_flow)
-            all_valid_idxes.append(valid_idx_0)
-            all_pc0_points.append(pc0_tracked)
-
-        # Step 3: Subsequent steps with sliding history window
+        # Step 2.2: Subsequent steps with sliding history window
         for t in range(1, num_acc_steps):
             pc_t_key = f'pc{t}'
             pc_t1_key = f'pc{t + 1}'
@@ -610,32 +599,39 @@ class AccFlow(nn.Module):
             pc_t_3dvoxel_infos_lst = result_t['pc0_3dvoxel_infos_lst']
             valid_idxes_t = [e["point_idxes"] for e in pc_t_3dvoxel_infos_lst]
 
-            # KNN interpolation for each sample in batch
+            step_tracked = []
             for b in range(batch_size):
-                accumulated_pos = accumulated_positions[b]
-                accumulated_flow = accumulated_flows[b]
-
-                # Get pc_t's valid points (already in pc1 coord)
                 pc_t_in_pc1 = all_pcs[pc_t_key][b]
                 valid_mask_t = ~torch.isnan(pc_t_in_pc1[:, 0])
                 pc_t_valid = pc_t_in_pc1[valid_mask_t]
+                step_tracked.append(pc_t_valid[valid_idxes_t[b]])
 
-                flow_t = flows_t[b]
-                valid_idx_t = valid_idxes_t[b]
-                pc_t_tracked = pc_t_valid[valid_idx_t]
+            flows_per_step.append(flows_t)
+            tracked_points_per_step.append(step_tracked)
+            valid_idxes_per_step.append(valid_idxes_t)
 
-                # Interpolate flow from pc_t's tracked points to accumulated positions
-                if accumulated_pos.shape[0] > 0 and pc_t_tracked.shape[0] > 0:
-                    interpolated_flow = interpolate_flow(
-                        accumulated_pos, pc_t_tracked, flow_t,
-                        method=self.interpolation_method,
-                        k=self.knn_k
-                    )
-
-                    # Update accumulated position and flow
-                    accumulated_positions[b] = accumulated_pos + interpolated_flow
-                    accumulated_flows[b] = accumulated_flow + interpolated_flow
-
+        # Step 3: Interpolate and accumulate using precomputed flows
+        all_valid_idxes = valid_idxes_per_step[0]
+        all_pc0_points = tracked_points_per_step[0]
+        (accumulated_positions,
+         accumulated_flows) = self._interpolate_and_accumulate(
+            flows_per_step,
+            tracked_points_per_step,
+            batch_size,
+        )
+        # print(f'num_acc_steps: {num_acc_steps}')
+        # print(f'flows_per_step lengths: {[len(f) for f in flows_per_step]}')
+        # print(f'tracked_points_per_step lengths: {[len(tp) for tp in tracked_points_per_step]}')
+        # print(f'flow shape after accumulation: {accumulated_flows[0].shape}')
+        # print(f'pc0 points shape: {all_pc0_points[0].shape}')
+        flows_per_step_gt = [batch[f'flow_t1_{t}_gt'] for t in range(num_acc_steps)]
+        tracked_points_per_step_gt = [batch[f'pc{t}'] for t in range(num_acc_steps)]
+        (gt_accumulated_positions,
+         gt_accumulated_flows) = self._interpolate_and_accumulate(
+            flows_per_step_gt,
+            tracked_points_per_step_gt,
+            batch_size,
+        )
         # Package results
         result = {
             "flow": accumulated_flows,
@@ -644,9 +640,45 @@ class AccFlow(nn.Module):
             "pc0_points_lst": all_pc0_points,
             "accumulated_target_frame": num_acc_steps,
             "d_num_voxels": [0],
+            'gt_accumulated_flows': gt_accumulated_flows,
         }
 
         return result
+
+    def _interpolate_and_accumulate(self, flows_per_step, tracked_points_per_step, batch_size):
+        """Interpolate flows to accumulated positions and accumulate per step."""
+        accumulated_positions = []
+        accumulated_flows = []
+
+        for b in range(batch_size):
+            flow_0 = flows_per_step[0][b]
+            pc0_tracked = tracked_points_per_step[0][b]
+
+            accumulated_pos = pc0_tracked + flow_0
+            accumulated_flow = flow_0.clone()
+
+            accumulated_positions.append(accumulated_pos)
+            accumulated_flows.append(accumulated_flow)
+
+        for t in range(1, len(flows_per_step)):
+            for b in range(batch_size):
+                accumulated_pos = accumulated_positions[b]
+                accumulated_flow = accumulated_flows[b]
+
+                pc_t_tracked = tracked_points_per_step[t][b]
+                flow_t = flows_per_step[t][b]
+
+                if accumulated_pos.shape[0] > 0 and pc_t_tracked.shape[0] > 0:
+                    interpolated_flow = interpolate_flow(
+                        accumulated_pos, pc_t_tracked, flow_t,
+                        method=self.interpolation_method,
+                        k=self.knn_k
+                    )
+
+                    accumulated_positions[b] = accumulated_pos + interpolated_flow
+                    accumulated_flows[b] = accumulated_flow + interpolated_flow
+
+        return accumulated_positions, accumulated_flows
 
     def forward(self, batch, training_mode: bool = False):
         """
@@ -668,7 +700,37 @@ class AccFlow(nn.Module):
         # Check if accumulated training should be used
         # Requires future frames (pc2, pc3, ...) in batch
         has_future_frames = 'pc2' in batch and 'pose2' in batch
-        
+        # print(f'batch keys: {list(batch.keys())}')
+        if training_mode and has_future_frames:
+            # print('Using accumulated error training with future frames.')
+            flow_t1_4_gt = []
+            flow_t1_3_gt = []
+            flow_t1_2_gt = []
+            flow_t1_1_gt = []
+            flow_t1_0_gt = []
+            batch["flow0"] = batch["flow"]
+            for batch_id in range(len(batch["pose0"])):
+                for key in [5,4,3,2,1]:
+                    pose_key_to_before = cal_pose0to1(batch[f"pose{key}"][batch_id], batch[f"pose{key-1}"][batch_id]) 
+                    flow_key_sub1 = (batch[f"pc{key-1}"][batch_id]+batch[f"flow{key-1}"][batch_id]) @ pose_key_to_before[:3, :3].T + pose_key_to_before[:3, 3]- batch[f"pc{key-1}"][batch_id]
+                    pose_before_to_1 = cal_pose0to1(batch[f"pose{key-1}"][batch_id], batch[f"pose1"][batch_id])
+                    #非常ugly，但是在这里还是写成这样最清楚，用栈表示会更加乱，人的注意力是有限的。
+                    if key-1 == 4:
+                        flow_t1_4_gt.append(flow_key_sub1 @ pose_before_to_1[:3, :3].T)
+                    elif key-1 == 3:
+                        flow_t1_3_gt.append(flow_key_sub1 @ pose_before_to_1[:3, :3].T)
+                    elif key-1 == 2:
+                        flow_t1_2_gt.append(flow_key_sub1 @ pose_before_to_1[:3, :3].T)
+                    elif key-1 == 1:
+                        flow_t1_1_gt.append(flow_key_sub1 @ pose_before_to_1[:3, :3].T)
+                    elif key-1 == 0:
+                        flow_t1_0_gt.append(flow_key_sub1 @ pose_before_to_1[:3, :3].T)
+            batch["flow_t1_4_gt"] = torch.stack(flow_t1_4_gt, dim=0)
+            batch["flow_t1_3_gt"] = torch.stack(flow_t1_3_gt, dim=0)
+            batch["flow_t1_2_gt"] = torch.stack(flow_t1_2_gt, dim=0)
+            batch["flow_t1_1_gt"] = torch.stack(flow_t1_1_gt, dim=0)
+            batch["flow_t1_0_gt"] = torch.stack(flow_t1_0_gt, dim=0)
+            pass #if training mode
         if training_mode and has_future_frames and self.accumulate_probs is not None:
             return self.forward_accumulated_error(batch)
         else:

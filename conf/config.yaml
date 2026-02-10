@@ -8,9 +8,9 @@ slurm_id: 00000
 wandb_mode: offline # [offline, disabled, online]
 wandb_project_name: seflow
 
-train_data: /workspace/preprocess_step1/preprocess_step1/sensor/train
+train_data: /root/autodl-tmp/procressed_opensf_av2/preprocess_step1/sensor/train
 train_aug: False # involved by deltaflow
-val_data: /workspace/preprocess_step1/preprocess_step1/sensor/val
+val_data: /root/autodl-tmp/procressed_opensf_av2/preprocess_step1/sensor/val
 output: ${model.name}-${slurm_id}
 
 checkpoint: 

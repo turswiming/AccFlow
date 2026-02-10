@@ -60,6 +60,8 @@ def collate_fn_pad(batch):
                     pcs_after_mask_ground[key] = []
                 pcs_after_mask_ground[key].append(single_data[key][~single_data[gm_key]])
             elif key.startswith('flow'):
+                if single_data[key] is None:
+                    continue
                 id_flow = extract_flow_number(key)
                 gm_key = f'gm{id_flow}'
                 # Save original flow before filtering
@@ -664,6 +666,8 @@ class HDF5DatasetFutureFrames(Dataset):
                 data_dict['pose1'] = f[next_timestamp]['pose'][:]
                 data_dict['pc1'] = f[next_timestamp]['lidar'][:][:,:3]
                 data_dict['gm1'] = f[next_timestamp]['ground_mask'][:]
+                if 'flow' in f[next_timestamp]:
+                    data_dict["flow1"] = f[next_timestamp]['flow'][:]
                 if self.ssl_label is not None:
                     data_dict['pc1_dynamic'] = self.ssl_label(f[next_timestamp])
             
@@ -680,12 +684,13 @@ class HDF5DatasetFutureFrames(Dataset):
                     future_pc = f[future_timestamp]['lidar'][:][:,:3]
                     future_gm = f[future_timestamp]['ground_mask'][:]
                     future_pose = f[future_timestamp]['pose'][:]
-                    
+                    future_flow = f[future_timestamp]['flow'][:] if 'flow' in f[future_timestamp] else None
                     # Store as pc2, pc3, etc. (not pch1, pch2 like history frames)
                     data_dict[f'pc{i+1}'] = future_pc
                     data_dict[f'gm{i+1}'] = future_gm
                     data_dict[f'pose{i+1}'] = future_pose
-                    
+                    if future_flow is not None:
+                        data_dict[f'flow{i+1}'] = future_flow
                     if self.ssl_label is not None:
                         data_dict[f'pc{i+1}_dynamic'] = self.ssl_label(f[future_timestamp])
 
@@ -868,6 +873,8 @@ class HDF5DatasetAccFlow(Dataset):
             data_dict['pc1'] = f[next_timestamp]['lidar'][:][:,:3]
             data_dict['gm1'] = f[next_timestamp]['ground_mask'][:]
             data_dict['pose1'] = f[next_timestamp]['pose'][:]
+            if 'flow' in f[next_timestamp]:
+                data_dict['flow1'] = f[next_timestamp]['flow'][:]
             if self.ssl_label is not None:
                 data_dict['pc1_dynamic'] = self.ssl_label(f[next_timestamp])
 
@@ -893,6 +900,8 @@ class HDF5DatasetAccFlow(Dataset):
                 data_dict[f'pc{i+1}'] = f[future_timestamp]['lidar'][:][:,:3]
                 data_dict[f'gm{i+1}'] = f[future_timestamp]['ground_mask'][:]
                 data_dict[f'pose{i+1}'] = f[future_timestamp]['pose'][:]
+                if 'flow' in f[future_timestamp]:
+                    data_dict[f'flow{i+1}'] = f[future_timestamp]['flow'][:]
                 
                 if self.ssl_label is not None:
                     data_dict[f'pc{i+1}_dynamic'] = self.ssl_label(f[future_timestamp])

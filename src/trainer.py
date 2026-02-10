@@ -104,7 +104,7 @@ class ModelWrapper(LightningModule):
 
         # Check if this is AccFlow model with accumulated error training
         is_accflow = self.model.__class__.__name__ in ['AccFlow', 'AccFlow2Frame']
-        if is_accflow and self.cfg_loss_name == 'accflowLoss':
+        if is_accflow and self.cfg_loss_name in ['accflowLoss',"accflowsupLoss"]:
             res_dict = self.model(batch, training_mode=True)
         else:
             res_dict = self.model(batch)
@@ -207,6 +207,20 @@ class ModelWrapper(LightningModule):
                         else:
                             loss_scale = 1.0
                         loss_logger[key] += res_loss[key] * loss_scale
+        if is_accflow and self.cfg_loss_name == 'accflowsupLoss' and 'accumulated_target_frame' in res_dict:
+            for batch_id in range(batch_sizes):
+                pc0_valid_from_pc2res = pc0_valid_idx[batch_id]
+                dict2loss = {'est_flow': est_flow[batch_id],
+                            'gt_flow': res_dict["gt_accumulated_flows"][batch_id][pc0_valid_from_pc2res],
+                            'gt_classes': batch['flow_category_indices'][batch_id][pc0_valid_from_pc2res],
+                            # 'gt_instance':  batch['flow_instance_id'][batch_id][pc0_valid_from_pc2res],
+                            'gt_instance':None,
+                            }
+                res_loss = self.loss_fn(dict2loss)
+                for i, loss_name in enumerate(loss_items):
+                    total_loss += weights[i] * res_loss[loss_name]
+                for key in res_loss:
+                    loss_logger[key] += res_loss[key]
         else:
             # Standard training flow for other models
             for batch_id in range(batch_sizes):
